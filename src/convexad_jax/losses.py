@@ -1,0 +1,119 @@
+# =============================================================================
+# LOSSES
+# =============================================================================
+# Single-instance (no leading batch axis). The FFT-based fidelity term is
+# left to JAX's built-in autodiff: jnp.fft is linear, so its VJP is just an
+# (adjoint) FFT with no extra activation storage -- there is nothing a
+# hand-written adjoint would improve here.
+import jax
+import jax.numpy as jnp
+
+
+def mae(Iobs, Icalc):
+    """Normalized mean absolute error."""
+    return jnp.sum(jnp.abs(Iobs - Icalc)) / jnp.sum(Iobs)
+
+
+def poisson_kl(Iobs, Icalc, eps=1e-12):
+    """Poisson KL divergence, averaged per voxel."""
+    ratio = Iobs / (Icalc + eps)
+    kl = Icalc - Iobs + jnp.where(Iobs > 0, Iobs * jnp.log(ratio), 0.0)
+    N = Iobs.size
+    return jnp.sum(kl) / N
+
+
+def _center_pad(obj, target_shape):
+    pads = []
+    for src, dst in zip(obj.shape, target_shape):
+        delta = dst - src
+        p0 = delta // 2
+        p1 = delta - p0
+        pads.append((p0, p1))
+    return jnp.pad(obj, pads)
+
+
+def fourier_loss(support, amplitude, phase, Iobs, metric="mae"):
+    """Forward model (support * amplitude * phasor -> padded FFT -> |.|^2)
+    plus a data-fidelity metric against Iobs.
+    """
+    modulus = support * amplitude
+
+    if isinstance(phase, tuple):
+        c, s = phase
+        obj = jax.lax.complex(modulus * c, modulus * s)
+    else:
+        obj = jax.lax.complex(modulus * jnp.cos(phase), modulus * jnp.sin(phase))
+
+    obj_p = _center_pad(obj, Iobs.shape)
+
+    Icalc = jnp.abs(
+        jnp.fft.ifftshift(jnp.fft.fftn(jnp.fft.fftshift(obj_p)))
+    ) ** 2
+
+    Iobs = Iobs.astype(jnp.float32)
+    Icalc = Icalc.astype(jnp.float32)
+
+    if metric == "mae":
+        return mae(Iobs, Icalc)
+    if metric == "poisson":
+        return poisson_kl(Iobs, Icalc)
+    raise ValueError(f"Unknown metric: {metric!r}, choose 'mae' or 'poisson'.")
+
+
+def tv_loss_phase(phase, eps=1e-9):
+    """Total variation of the phase field (scalar phase or (c, s) phasor)."""
+
+    def diff(x, axis):
+        return jnp.diff(x, axis=axis)
+
+    if isinstance(phase, tuple):
+        c, s = phase
+        dcx, dcy, dcz = diff(c, 0), diff(c, 1), diff(c, 2)
+        dsx, dsy, dsz = diff(s, 0), diff(s, 1), diff(s, 2)
+
+        dcx2 = jnp.square(dcx[:, :-1, :-1])
+        dcy2 = jnp.square(dcy[:-1, :, :-1])
+        dcz2 = jnp.square(dcz[:-1, :-1, :])
+
+        dsx2 = jnp.square(dsx[:, :-1, :-1])
+        dsy2 = jnp.square(dsy[:-1, :, :-1])
+        dsz2 = jnp.square(dsz[:-1, :-1, :])
+
+        grad_sq = (dcx2 + dcy2 + dcz2) + (dsx2 + dsy2 + dsz2)
+        return jnp.mean(grad_sq + eps)
+
+    phi = phase
+
+    def wrapped_diff(p, axis):
+        d = jnp.diff(p, axis=axis)
+        return jnp.arctan2(jnp.sin(d), jnp.cos(d))
+
+    dx = wrapped_diff(phi, 0)
+    dy = wrapped_diff(phi, 1)
+    dz = wrapped_diff(phi, 2)
+
+    dx2 = jnp.square(dx[:, :-1, :-1])
+    dy2 = jnp.square(dy[:-1, :, :-1])
+    dz2 = jnp.square(dz[:-1, :-1, :])
+
+    grad_sq = dx2 + dy2 + dz2
+    return jnp.mean(grad_sq + eps)
+
+
+def small_support(support):
+    """Penalty on the size (mass) of the support."""
+    return jnp.sum(support)
+
+
+def total_loss(support, amplitude, phase, Iobs, alpha=0.8, beta=0.1, metric="mae"):
+    """Fourier fidelity + support-size penalty + phase-TV penalty.
+
+    Parameters
+    ----------
+    alpha : weight for the support-size penalty.
+    beta  : weight for the phase TV penalty.
+    """
+    fourier = fourier_loss(support, amplitude, phase, Iobs, metric=metric)
+    small = alpha * small_support(support)
+    smooth_phase = beta * tv_loss_phase(phase)
+    return fourier + small + smooth_phase
