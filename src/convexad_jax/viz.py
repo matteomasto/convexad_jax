@@ -391,3 +391,29 @@ def plot_2D_slices_middle_only_phase(
         voxel_sizes=voxel_sizes,
         fig_title=fig_title,
     )
+
+def plot_2D_slices_middle_and_histogram(obj,
+                                        crop=False,
+                                        support=None, threshold_module=None, unwrap=True,
+                                        ax=None, fig=None, fw=3,
+                                        fig_title=None,
+                                        return_fig_ax=False):
+    if fig is None:
+        fig,ax = plt.subplots(3,3, figsize=(fw*3,fw*3))
+    
+    plot_module_histogram(obj, fig=fig, ax=ax[0,1], crop=crop)
+    fig.delaxes(ax[0,0])
+    fig.delaxes(ax[0,2])
+    
+    plot_2D_slices_middle(obj, 
+                          support = support, threshold_module=threshold_module, unwrap=unwrap,
+                          fig=fig, ax=ax[1:], fw=fw, crop=crop)
+    
+    if fig_title is not None:
+        fig.suptitle(fig_title, fontsize=20)
+    fig.tight_layout()
+    if return_fig_ax:
+        return fig,ax
+    else:
+        return
+
