@@ -202,90 +202,174 @@ def plot_3D_projections(
         fig.suptitle(fig_title)
 
     fig.tight_layout()
-
+    return
 
 # -----------------------------------------------------------------------------
 
-def plot_2D_slices_middle_one_array3D(
-    array: np.ndarray,
-    index: int | None = None,
-    voxel_sizes=None,
-    add_colorbar: bool = True,
-    cmap: str = "gray_r",
-    norm=None,
-    ax=None,
-    fig=None,
-    fw: float = 3,
-    fig_title: str | None = None,
-    alpha=1.0,
-    vmin=None,
-    vmax=None,
-    aspect=None,
-    symmetric_colorscale: bool = False,
-):
-    """
-    Plot central orthogonal slices of a 3D array.
+def plot_module_histogram(obj,
+                          crop=True,
+                          bins=None, 
+                          fig=None, ax=None):
+    module, phase = get_cropped_module_phase(obj, crop=crop)
+    module[module<.01*np.max(module)] = np.nan
+    if ax is None:
+        fig,ax = plt.subplots(1,1, figsize=(6,4))
+        
+    if bins is None:
+        if obj.ndim == 2:
+            bins = 30
+        if obj.ndim == 3:
+            bins = 50
+    n, bins, patches = ax.hist(module.flatten(), bins=bins)
 
-    Parameters
-    ----------
-    array : np.ndarray
-        3D array
-    index : int, optional
-        Slice index (same for all axes). Defaults to center.
-    voxel_sizes : tuple, optional
-        Physical voxel size (Å). Converted to nm internally.
-    symmetric_colorscale : bool
-        Force symmetric [-max, max] range
-    """
-    array = _to_numpy(array)
+    ax.set_xlabel('object module value', fontsize=15)
+    ax.set_ylabel('number of pixels', fontsize=15)
+    return
+
+
+######################################################################################################################################
+###########################            Plot slices in the middle of the array              ###########################################
+###################################################################################################################################### 
+
+def plot_2D_slices_middle_one_array3D(array,
+                                      index=None,
+                                      voxel_sizes=None, # voxel size in Angstrom
+                                      add_colorbar=True, cbar_position='right', cbar_label=None,
+                                 cmap='gray_r', norm=None,
+                                 ax=None, fig=None,
+                                 fw=3,
+                                 fig_title = None, 
+                                      xlabel=['nm','nm','nm'], ylabel=[None,None,None],
+                                 alpha=1,
+                                 vmin=None,vmax=None, aspect=None,
+                                 symmetric_colorscale=False):
+    
+    if symmetric_colorscale:
+        cmap='coolwarm'
+    
     shape = array.shape
-
+    
     if fig is None:
-        fig, ax = plt.subplots(1, 3, figsize=(3 * fw, fw))
-
+        fig, ax = plt.subplots(1,3, figsize=(3*fw,fw))
+        
     if voxel_sizes is not None:
-        voxel_sizes = 0.1 * np.array(voxel_sizes)  # Å → nm
+        voxel_sizes = .1*np.array(voxel_sizes) # Put the voxel_sizes in nanometers
+        extent = [[0, array.shape[2]*voxel_sizes[2], 0, array.shape[1]*voxel_sizes[1]], 
+                   [0, array.shape[2]*voxel_sizes[2], 0, array.shape[0]*voxel_sizes[0]],
+                   [0, array.shape[1]*voxel_sizes[1], 0, array.shape[0]*voxel_sizes[0]]]
     else:
-        voxel_sizes = None
-
-    images = []
-
+        extent= [None, None, None]
+    
+    im = []
     for n in range(3):
-        s = [slice(None)] * 3
-        s[n] = shape[n] // 2 if index is None else min(index, shape[n] - 1)
-
+        s = [slice(None, None, None) for ii in range(3)]
+        if index is None:
+            s[n] = shape[n]//2
+        else:
+            s[n] = min(index,shape[n]-1)
         arr = array[tuple(s)]
-
         if symmetric_colorscale:
             vmax = np.nanmax(np.abs(arr))
             vmin = -vmax
-            cmap = "coolwarm"
-
-        im = ax[n].imshow(
-            arr,
-            cmap=cmap,
-            alpha=alpha,
-            vmin=vmin,
-            vmax=vmax,
-            norm=norm,
-            aspect=aspect,
-        )
-
-        images.append(im)
+        if hasattr(alpha, "__len__"):
+            alpha_plot = np.copy(alpha[tuple(s)])
+            # Need to make the plot twice to avoid a matplotlib bug
+            im.append(ax[n].imshow(arr, cmap=cmap, vmin=vmin,vmax=vmax, extent=extent[n], norm=norm,aspect=aspect))
+            ax[n].cla()
+            ax[n].imshow(arr, cmap=cmap, alpha=alpha_plot, vmin=vmin,vmax=vmax, extent=extent[n], norm=norm,aspect=aspect)
+        else:
+            im.append(ax[n].imshow(arr, cmap=cmap, alpha=alpha, vmin=vmin,vmax=vmax, extent=extent[n], norm=norm,aspect=aspect))
+    
 
     if add_colorbar:
-        for i, im in enumerate(images):
-            divider = make_axes_locatable(ax[i])
-            cax = divider.append_axes("right", size="5%", pad=0.05)
-            fig.colorbar(im, cax=cax)
-
-    if fig_title:
-        fig.suptitle(fig_title)
-
+        for ii, img in enumerate(im):
+            divider = make_axes_locatable(ax[ii])
+            cax = divider.append_axes(cbar_position, size='5%', pad=.05)
+#             cax = divider.append_axes('right', size='10%', pad=pad_colorbar)
+            cbar = fig.colorbar(img, cax=cax, orientation='vertical')
+            if cbar_label is not None:
+                cbar.ax.set_ylabel(cbar_label, rotation=270,fontsize=20*fw/4., labelpad=10*fw)
+        
+    if fig_title is not None:
+        fig.suptitle(fig_title, fontsize=20*fw/4.)
+        
+    if voxel_sizes is not None:
+        for n in range(3):
+            ax[n].set_xlabel(xlabel[n],fontsize=15*fw/4.)
+            ax[n].set_ylabel(ylabel[n],fontsize=15*fw/4.)
+            ax[n].xaxis.set_ticks_position('bottom')
+            
+    for axe in ax.flatten():
+        axe.locator_params(nbins=4)
+    
     fig.tight_layout()
+        
+    return
 
+def plot_2D_slices_middle_only_module(obj,
+                                      crop=False,
+                                      voxel_sizes=None,
+                                      cmap='gray_r', vmin=None,vmax=None,
+                                  ax=None, fig=None, fw=3,
+                                      fig_title=None,
+                                  alpha=1):
+    module, phase = get_cropped_module_phase(obj, unwrap=False, crop=crop)
+    plot_2D_slices_middle_one_array3D(module, cmap=cmap, ax=ax, fig=fig, fw=fw, alpha=alpha, fig_title=fig_title,
+                                      voxel_sizes=voxel_sizes,
+                                      vmin=vmin, vmax=vmax)  
+    return
 
-# -----------------------------------------------------------------------------
+def plot_2D_slices_middle_only_phase(obj,
+                                     crop=False,
+                                     threshold_module = None, support = None,
+                                     voxel_sizes=None,
+                                     cmap='hsv', vmin=None,vmax=None,
+                                     unwrap=True,
+                                     ax=None, fig=None, fw=3, 
+                                    fig_title=None):
+    
+    module, phase = get_cropped_module_phase(obj,
+                             threshold_module = threshold_module, support = support,
+                             crop=crop, apply_fftshift=False, unwrap=unwrap)
+    plot_2D_slices_middle_one_array3D(phase, cmap=cmap, vmin=vmin, vmax=vmax,
+                                      ax=ax, fig=fig, fw=fw, fig_title=fig_title, voxel_sizes=voxel_sizes)  
+    return
+
+def plot_2D_slices_middle(obj,
+                          crop=False,
+                          support=None, threshold_module=None, unwrap=True,
+                          voxel_sizes=None,
+                          ax=None, fig=None, fw=3,
+                          fig_title=None,
+                          return_fig_ax=False):
+    
+#     if not np.any(np.iscomplex(obj)):
+    if not (isinstance(obj[0,0,0], complex) or isinstance(obj[0,0,0], np.complex64) or isinstance(obj[0,0,0], np.complex128)) :
+        # Function was called maybe by mistake on a real (non-complex) array
+        plot_2D_slices_middle_one_array3D(obj, voxel_sizes=voxel_sizes,
+                                          ax=ax, fig=fig, fw=fw, fig_title=fig_title)
+        return
+    
+    if fig is None:
+        fig, ax = plt.subplots(2,3, figsize=(3*fw, 2*fw))
+        
+    plot_2D_slices_middle_only_module(obj, ax=ax[0], fig=fig, voxel_sizes=voxel_sizes, crop=crop)  
+    plot_2D_slices_middle_only_phase(obj, support=support, threshold_module=threshold_module,
+                                     ax=ax[1], fig=fig,
+                                     voxel_sizes=voxel_sizes, crop=crop, unwrap=unwrap)  
+    
+    ax[0,0].set_ylabel('module', fontsize=20)
+    ax[1,0].set_ylabel('phase', fontsize=20)
+    
+    if fig_title is not None:
+        fig.suptitle(fig_title, fontsize=20)
+    
+    fig.tight_layout()
+        
+    if return_fig_ax:
+        return fig,ax
+    else:
+        return
 
 def get_cropped_module_phase(
     obj: np.ndarray,
@@ -340,58 +424,6 @@ def get_cropped_module_phase(
 
 # -----------------------------------------------------------------------------
 
-def plot_2D_slices_middle_only_module(
-    obj: np.ndarray,
-    crop: bool = False,
-    voxel_sizes=None,
-    cmap="gray_r",
-    vmin=None,
-    vmax=None,
-    fig_title=None,
-):
-    """
-    Convenience wrapper: plot amplitude slices.
-    """
-    module, _ = get_cropped_module_phase(obj, crop=crop)
-
-    plot_2D_slices_middle_one_array3D(
-        module,
-        cmap=cmap,
-        voxel_sizes=voxel_sizes,
-        vmin=vmin,
-        vmax=vmax,
-        fig_title=fig_title,
-    )
-
-
-def plot_2D_slices_middle_only_phase(
-    obj: np.ndarray,
-    crop: bool = False,
-    threshold_module=None,
-    support=None,
-    voxel_sizes=None,
-    cmap="hsv",
-    unwrap=True,
-    fig_title=None,
-):
-    """
-    Convenience wrapper: plot phase slices.
-    """
-    _, phase = get_cropped_module_phase(
-        obj,
-        threshold_module=threshold_module,
-        support=support,
-        crop=crop,
-        unwrap=unwrap,
-    )
-
-    plot_2D_slices_middle_one_array3D(
-        phase,
-        cmap=cmap,
-        voxel_sizes=voxel_sizes,
-        fig_title=fig_title,
-    )
-
 def plot_2D_slices_middle_and_histogram(obj,
                                         crop=False,
                                         support=None, threshold_module=None, unwrap=True,
@@ -416,4 +448,30 @@ def plot_2D_slices_middle_and_histogram(obj,
         return fig,ax
     else:
         return
+    
+def plot_2D_slices_middle_only_module_and_histogram(obj,
+                                                    crop=False,
+                                                    ax=None, fig=None, fw=3,
+                                                    fig_title=None,
+                                                    return_fig_ax=False):
+    if fig is None:
+        fig,ax = plt.subplots(2,3, figsize=(fw*3,fw*2))
+    
+    plot_module_histogram(obj, fig=fig, ax=ax[0,1], crop=crop)
+    fig.delaxes(ax[0,0])
+    fig.delaxes(ax[0,2])
+    
+    plot_2D_slices_middle_only_module(obj,
+                          fig=fig, ax=ax[1], fw=fw, crop=crop)
+    
+    if fig_title is not None:
+        fig.suptitle(fig_title, fontsize=20)
+    fig.tight_layout()
+    
+    if return_fig_ax:
+        return fig,ax
+    else:
+        return
+
+
 
