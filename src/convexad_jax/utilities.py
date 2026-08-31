@@ -111,3 +111,21 @@ def center_object(obj,
         return obj_cen, support_cen
     else: 
         return obj_cen
+
+def crop_array_half_size(array):
+    """
+    Crop the array around its center to half its size in every dimension.
+
+    For each dimension N, the output size is ceil(N / 2).
+    Works for any number of dimensions.
+    """
+    shape = array.shape
+
+    slices = []
+    for n in shape:
+        target = (n + 1) // 2  # ceil(n / 2)
+        start = (n - target) // 2
+        stop = start + target
+        slices.append(slice(start, stop))
+
+    return array[tuple(slices)]
