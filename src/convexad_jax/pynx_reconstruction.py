@@ -284,7 +284,7 @@ def CDI_one_reconstruction(data, params,
     
     if params['plot_result']:
         if obj.ndim ==3:
-            plot_2D_slices_middle_and_histogram(obj, support=support)
+            plot_2D_slices_middle_and_histogram(obj, support=support, threshold_module = support_threshold_relative)
         if obj.ndim ==2:
             plot_object_module_phase_2d(obj)
         
