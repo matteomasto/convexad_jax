@@ -1,3 +1,4 @@
+from . import viz
 from .support import halfspace_support, compute_support, init_support_params
 from .phase import (
     init_phase_params,
@@ -13,6 +14,7 @@ from .optimize import (
 )
 
 __all__ = [
+    "viz",
     "halfspace_support",
     "compute_support",
     "init_support_params",
