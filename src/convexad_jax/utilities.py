@@ -89,3 +89,25 @@ def center_the_center_of_mass(data,
             return data_cen, qx, qy, qz
         else:
             return data_cen
+
+def center_object(obj, 
+                  standard_com=True,
+                  support=None):
+    module = np.abs(obj)
+    
+    module_cen, offset = center_the_center_of_mass(module, return_offsets=True, standard_com=standard_com)
+    
+    # I make the centering twice, I use a cropping for the second one
+    shape = obj.shape
+    module_cen = crop_array_half_size(module_cen)
+    module_cen2, offset2 = center_the_center_of_mass(module_cen, return_offsets=True,standard_com=standard_com)
+
+    total_offset = np.array(offset)+np.array(offset2)
+
+    obj_cen = np.roll(obj, total_offset, axis=range(len(shape))) 
+    
+    if support is not None:
+        support_cen = np.roll(support, total_offset, axis=range(len(shape)))
+        return obj_cen, support_cen
+    else: 
+        return obj_cen
