@@ -45,6 +45,61 @@ def crop_tensor_half_size(tensor: np.ndarray) -> np.ndarray:
     ]
 
 
+def plot_module_histogram(obj,
+                          crop=True,
+                          bins=None, 
+                          fig=None, ax=None):
+    module, phase = get_cropped_module_phase(obj, crop=crop)
+    module[module<.01*np.max(module)] = np.nan
+    if ax is None:
+        fig,ax = plt.subplots(1,1, figsize=(6,4))
+        
+    if bins is None:
+        if obj.ndim == 2:
+            bins = 30
+        if obj.ndim == 3:
+            bins = 50
+    n, bins, patches = ax.hist(module.flatten(), bins=bins)
+
+    ax.set_xlabel('object module value', fontsize=15)
+    ax.set_ylabel('number of pixels', fontsize=15)
+    return
+
+def plot_2D_slices_middle(obj,
+                          crop=False,
+                          support=None, threshold_module=None, unwrap=True,
+                          voxel_sizes=None,
+                          ax=None, fig=None, fw=3,
+                          fig_title=None,
+                          return_fig_ax=False):
+    
+#     if not np.any(np.iscomplex(obj)):
+    if not (isinstance(obj[0,0,0], complex) or isinstance(obj[0,0,0], np.complex64) or isinstance(obj[0,0,0], np.complex128)) :
+        # Function was called maybe by mistake on a real (non-complex) array
+        plot_2D_slices_middle_one_array3D(obj, voxel_sizes=voxel_sizes,
+                                          ax=ax, fig=fig, fw=fw, fig_title=fig_title)
+        return
+    
+    if fig is None:
+        fig, ax = plt.subplots(2,3, figsize=(3*fw, 2*fw))
+        
+    plot_2D_slices_middle_only_module(obj, ax=ax[0], fig=fig, voxel_sizes=voxel_sizes, crop=crop)  
+    plot_2D_slices_middle_only_phase(obj, support=support, threshold_module=threshold_module,
+                                     ax=ax[1], fig=fig,
+                                     voxel_sizes=voxel_sizes, crop=crop, unwrap=unwrap)  
+    
+    ax[0,0].set_ylabel('module', fontsize=20)
+    ax[1,0].set_ylabel('phase', fontsize=20)
+    
+    if fig_title is not None:
+        fig.suptitle(fig_title, fontsize=20)
+    
+    fig.tight_layout()
+        
+    if return_fig_ax:
+        return fig,ax
+    else:
+        return
 # -----------------------------------------------------------------------------
 
 def plot_3D_projections(
