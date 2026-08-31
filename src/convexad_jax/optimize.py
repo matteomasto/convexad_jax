@@ -174,45 +174,21 @@ def reconstruct(
     support_type="single",
     support_kwargs=None,
     optimizer="adam",
-    max_steps=300,
+    max_steps=5000,          # was 300 -- TF ran 5000; cheap under while_loop/vmap
     tol=1e-6,
     memory_size=10,
     learning_rate=0.05,
+    decay_steps=500,         # NEW -- matches TF's ExponentialDecay
+    decay_rate=0.9,          # NEW
+    staircase=True,          # NEW
+    b1=0.9,                  # NEW
+    b2=0.98,                 # NEW -- matches TF (optax default is 0.999)
+    eps_adam=1e-6,           # NEW -- matches TF (optax default is 1e-8)
     grid_shape=None,
 ):
-    """Run `n_restarts` independent optimizations in parallel (vmapped) and
-    return the best one by final loss.
 
-    Parameters
-    ----------
-    support_type : "single" (default) | "multi"
-        "multi" reconstructs a non-convex object as a soft union of several
-        convex parts (see multi_support.py). `support_kwargs` may contain
-        "M_parts" (default 2), "N_per_part" (default N), "use_gates"
-        (default False).
-    optimizer : "adam" (default) | "lbfgs"
-        See `_solve_one_adam`'s docstring for why "adam" is the default:
-        on this project's actual (non-smooth) loss, L-BFGS was observed to
-        stall well short of a good minimum in a self-consistency test,
-        while Adam did not. Use "lbfgs" if you've modified the loss to
-        remove its kinks, or want to fine-tune the last mile after an
-        Adam run of your own.
-    learning_rate : float
-        Only used when `optimizer="adam"`.
-    memory_size : int
-        Only used when `optimizer="lbfgs"`; L-BFGS history depth.
+    
 
-    Notes
-    -----
-    - `n_restarts` is capped in practice by GPU memory. For "lbfgs" this is
-      dominated by the L-BFGS history (~ 2 * memory_size * n_params floats
-      per restart) at large grid sizes; lower `memory_size` to fit more
-      restarts. For "adam" the optimizer state is O(n_params) regardless.
-    - Because this uses `lax.while_loop` under `vmap`, all restarts run in
-      lockstep: the loop only exits once every lane has met its stopping
-      criterion. Restarts that converge early just perform cheap no-op-ish
-      steps afterwards -- correctness is unaffected, only wall-clock cost.
-    """
     Iobs = jnp.asarray(Iobs, dtype=jnp.float32)
     if grid_shape is None:
         grid_shape, coords = make_coords_for(Iobs.shape)
@@ -237,8 +213,12 @@ def reconstruct(
     }
 
     if optimizer == "adam":
-        solve = partial(_solve_one_adam, static=static, max_steps=max_steps,
-                         tol=tol, learning_rate=learning_rate)
+        solve = partial(
+            _solve_one_adam, static=static, max_steps=max_steps, tol=tol,
+            learning_rate=learning_rate, decay_steps=decay_steps,
+            decay_rate=decay_rate, staircase=staircase,
+            b1=b1, b2=b2, eps_adam=eps_adam,
+        )
     elif optimizer == "lbfgs":
         solve = partial(_solve_one_lbfgs, static=static, max_steps=max_steps,
                          tol=tol, memory_size=memory_size)
