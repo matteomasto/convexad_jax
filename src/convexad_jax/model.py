@@ -12,6 +12,7 @@ import jax.numpy as jnp
 
 from .support import compute_support, init_support_params, make_coords
 from .multi_support import init_multi_support_params, compute_multi_support
+from .support_freeform import init_freeform_support_params, compute_freeform_support
 from .phase import compute_phase, compute_phasor, init_phase_params
 from .losses import total_loss
 
@@ -32,12 +33,20 @@ def init_model(key, grid_shape, N=64, size_factor=4.0, phase_type="grid",
 
     Parameters
     ----------
-    support_type : "single" (default) | "multi"
+    support_type : "single" (default) | "multi" | "freeform"
         "single": one convex object, `N` half-spaces (as before).
         "multi": a non-convex object built as a soft union of several
             convex parts -- see multi_support.py. `support_kwargs` may
             contain "M_parts" (default 2), "N_per_part" (default N),
             "use_gates" (default False, learnable per-part on/off gates).
+        "freeform": one free logit per voxel -- see support_freeform.py.
+            Intended as a stage-2 release from a converged "single" or
+            "multi" solution, not a cold start (see
+            `optimize.reconstruct_two_stage`). `support_kwargs` may
+            contain "init_logit" ((D,H,W) array, typically
+            `support_freeform.invert_support_to_logit(S_stage1)`) and
+            "noise_scale" (default 0.0, to decorrelate a population of
+            restarts sharing the same warm start).
 
     Returns
     -------
@@ -64,8 +73,17 @@ def init_model(key, grid_shape, N=64, size_factor=4.0, phase_type="grid",
             use_gates=use_gates,
         )
         support_static = {"support_type": "multi", "use_gates": use_gates}
+    elif support_type == "freeform":
+        init_logit = support_kwargs.get("init_logit", None)
+        noise_scale = support_kwargs.get("noise_scale", 0.0)
+        support_params = init_freeform_support_params(
+            key_support, grid_shape, init_logit=init_logit, noise_scale=noise_scale
+        )
+        support_static = {"support_type": "freeform"}
     else:
-        raise ValueError(f"Unknown support_type: {support_type!r}, choose 'single' or 'multi'.")
+        raise ValueError(
+            f"Unknown support_type: {support_type!r}, choose 'single', 'multi' or 'freeform'."
+        )
 
     phase_params, phase_static = init_phase_params(
         key_phase, grid_shape, phase_type=phase_type, **(phase_kwargs or {})
@@ -111,6 +129,12 @@ def forward(params, coords, Iobs, eps, model_static):
         support = compute_multi_support(
             params["support"], coords, eps, use_gates=model_static.get("use_gates", False)
         )
+    elif support_type == "freeform":
+        # `eps` doubles as `T` here -- same "boundary softness, anneal it
+        # down" role it plays for compute_support/compute_multi_support,
+        # just without any half-space geometry behind it. `coords` is
+        # unused: every voxel already owns its own parameter.
+        support = compute_freeform_support(params["support"], T=eps)
     else:
         support = compute_support(params["support"], coords, eps)
 
@@ -144,12 +168,19 @@ def loss_fn(params, static):
     static = {
         "coords": (D, H, W, 3),
         "Iobs": (Do, Ho, Wo),
-        "eps": float,               # half-space softness
+        "eps": float,               # half-space softness, or freeform T
         "alpha": float,             # support-size weight
         "beta": float,              # phase-TV weight
         "metric": "mae" | "poisson",
         "phase_static": {...},      # from init_model, incl. support_type/use_gates
+        "gamma": float,             # optional: freeform perimeter weight (default 0)
+        "delta": float,             # optional: freeform double-well weight (default 0)
+        "zeta": float,              # optional: freeform anchor weight (default 0)
+        "S_ref": (D, H, W) | None,  # optional: freeform anchor target, required if zeta != 0
     }
+    The last four keys only matter for support_type == "freeform" (see
+    support_freeform.py); they default to 0/None so existing "single"/
+    "multi" call sites that never set them are unaffected.
     """
     support, amplitude, phase = forward(
         params, static["coords"], static["Iobs"], static["eps"], static["phase_static"]
@@ -157,4 +188,6 @@ def loss_fn(params, static):
     return total_loss(
         support, amplitude, phase, static["Iobs"],
         alpha=static["alpha"], beta=static["beta"], metric=static["metric"],
+        gamma=static.get("gamma", 0.0), delta=static.get("delta", 0.0),
+        zeta=static.get("zeta", 0.0), S_ref=static.get("S_ref", None),
     )

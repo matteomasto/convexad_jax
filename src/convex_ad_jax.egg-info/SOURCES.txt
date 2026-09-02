@@ -12,5 +12,8 @@ src/convexad_jax/model.py
 src/convexad_jax/multi_support.py
 src/convexad_jax/optimize.py
 src/convexad_jax/phase.py
+src/convexad_jax/pynx_reconstruction.py
 src/convexad_jax/support.py
+src/convexad_jax/utilities.py
+src/convexad_jax/viz.py
 tests/test_convex_ad_jax.py

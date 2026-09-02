@@ -8,6 +8,8 @@
 import jax
 import jax.numpy as jnp
 
+from .support_freeform import tv_support, double_well_support, anchor_penalty
+
 
 def mae(Iobs, Icalc):
     """Normalized mean absolute error."""
@@ -105,15 +107,42 @@ def small_support(support):
     return jnp.sum(support)
 
 
-def total_loss(support, amplitude, phase, Iobs, alpha=0.8, beta=0.1, metric="mae"):
-    """Fourier fidelity + support-size penalty + phase-TV penalty.
+def total_loss(
+    support, amplitude, phase, Iobs, alpha=0.8, beta=0.1, metric="mae",
+    gamma=0.0, delta=0.0, zeta=0.0, S_ref=None,
+):
+    """Fourier fidelity + support-size penalty + phase-TV penalty, plus
+    optional free-form support regularizers (support_freeform.py).
 
     Parameters
     ----------
     alpha : weight for the support-size penalty.
     beta  : weight for the phase TV penalty.
+    gamma : weight for `tv_support` (perimeter-like boundary regularizer).
+        0 by default -- a no-op for "single"/"multi" call sites that never
+        pass it.
+    delta : weight for `double_well_support` (pushes S toward {0, 1}).
+        0 by default, same reasoning as `gamma`.
+    zeta  : weight for `anchor_penalty` toward `S_ref`. 0 by default.
+    S_ref : optional (D, H, W) reference support to anchor toward (see
+        `support_freeform.anchor_penalty`); required if `zeta != 0`. Not
+        differentiated through -- stop_gradient'd here defensively even
+        though callers should already be passing a constant.
+
+    `gamma`/`delta`/`zeta` are defined generically here (nothing below
+    checks what produced `support`), so they COULD also lightly regularize
+    a "single"/"multi" convex support if ever useful -- they aren't tied to
+    support_type == "freeform" by construction, only by convention (see
+    model.loss_fn).
     """
     fourier = fourier_loss(support, amplitude, phase, Iobs, metric=metric)
     small = alpha * small_support(support)
     smooth_phase = beta * tv_loss_phase(phase)
-    return fourier + small + smooth_phase
+    total = fourier + small + smooth_phase
+    if gamma != 0.0:
+        total = total + gamma * tv_support(support)
+    if delta != 0.0:
+        total = total + delta * double_well_support(support)
+    if zeta != 0.0:
+        total = total + zeta * anchor_penalty(support, jax.lax.stop_gradient(S_ref))
+    return total
