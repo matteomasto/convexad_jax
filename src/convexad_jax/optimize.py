@@ -330,6 +330,8 @@ def reconstruct_two_stage(
     steps_per_stage=1000,
     gamma=1e-3,
     delta=1e-2,
+    alpha2=None,
+    beta2=None,
     noise_scale_support=0.0,
     noise_scale_phase=0.0,
     stage2_learning_rate=0.02,
@@ -373,7 +375,27 @@ def reconstruct_two_stage(
     steps_per_stage : Adam steps (or until `tol`) per schedule stage.
     gamma, delta : perimeter / double-well regularizer weights (see
         `support_freeform.tv_support` / `double_well_support`), held
-        constant across all stage-2 stages.
+        constant across all stage-2 stages. These do NOT resist splitting
+        into disconnected domains or growing concavities -- both cost the
+        same perimeter per unit boundary area as a convex bulge -- so
+        setting them to 0 to "give the field more freedom" is usually
+        counterproductive: it removes the pressure that keeps voxels
+        decisively in/out, which is what makes a genuine gap between two
+        domains (or a genuine notch) show up as S~0 instead of a blurry
+        S~0.4 compromise.
+    alpha2, beta2 : support-size / phase-TV weights for stage 2, DEFAULT
+        None (reuse stage 1's `alpha`/`beta` from `stage1_kwargs`, for
+        backwards compatibility). Pass these explicitly whenever stage 1
+        used `alpha=0` (common and often correct for the convex/multi-
+        convex parameterization, which cannot represent diffuse background
+        mass at all) -- the free-form support has no such structural
+        protection: every voxel is an independent parameter, so with
+        alpha=0 (and gamma=delta=0) nothing prices total support mass in
+        stage 2, and as T softens, leaked S from the (typically much
+        larger) background volume can dominate `amplitude =
+        sqrt(sum_I / (N*sum_S))` and destabilize the fit. A small nonzero
+        alpha2 (and/or gamma, delta) is usually needed even when stage 1's
+        alpha is legitimately 0.
     noise_scale_support, noise_scale_phase : stddev of Gaussian noise added
         to the support logit / phase params of each stage-2 restart on top
         of its assigned stage-1 warm start -- only matters when
@@ -396,6 +418,8 @@ def reconstruct_two_stage(
     alpha = stage1_kwargs.get("alpha", 0.8)
     beta = stage1_kwargs.get("beta", 0.1)
     metric = stage1_kwargs.get("metric", "mae")
+    alpha_stage2 = alpha if alpha2 is None else alpha2
+    beta_stage2 = beta if beta2 is None else beta2
 
     stage1_result = reconstruct(
         key1, Iobs, n_restarts=n_restarts_stage1, grid_shape=grid_shape,
@@ -448,8 +472,8 @@ def reconstruct_two_stage(
     base_static = {
         "coords": coords,
         "Iobs": Iobs_arr,
-        "alpha": alpha,
-        "beta": beta,
+        "alpha": alpha_stage2,
+        "beta": beta_stage2,
         "metric": metric,
         "gamma": gamma,
         "delta": delta,
