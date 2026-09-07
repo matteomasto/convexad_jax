@@ -1,7 +1,8 @@
 
 from .viz import * 
 import numpy as np
-
+import gc
+import jax
 
 def center_of_mass(array):
     cen = np.zeros(array.ndim)
@@ -129,3 +130,12 @@ def crop_array_half_size(array):
         slices.append(slice(start, stop))
 
     return array[tuple(slices)]
+
+def free_gpu(*names, namespace=None):
+    """Delete the given variable names from the given namespace (default: globals())
+    and force JAX to actually release the memory."""
+    ns = namespace if namespace is not None else globals()
+    for name in names:
+        ns.pop(name, None)
+    gc.collect()
+    jax.clear_caches()
