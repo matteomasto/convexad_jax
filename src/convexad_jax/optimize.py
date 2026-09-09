@@ -274,9 +274,13 @@ def reconstruct(
     b2=0.98,                 # NEW -- matches TF (optax default is 0.999)
     eps_adam=1e-6,           # NEW -- matches TF (optax default is 1e-8)
     grid_shape=None,
+    stop_amplitude_grad=False,   # NEW
+    n_adam_steps=200,            # NEW -- only used when optimizer="adam_gn"
+    n_gn_steps=20,               # NEW -- only used when optimizer="adam_gn"
+    lm_lambda0=1e-3,             # NEW -- only used when optimizer="adam_gn"
+    cg_maxiter=30,               # NEW -- only used when optimizer="adam_gn"
 ):
 
-    
 
     Iobs = jnp.asarray(Iobs, dtype=jnp.float32)
     if grid_shape is None:
@@ -299,6 +303,7 @@ def reconstruct(
         "beta": beta,
         "metric": metric,
         "phase_static": model_static,
+        "stop_amplitude_grad": stop_amplitude_grad,   # NEW
     }
 
     if optimizer == "adam":
