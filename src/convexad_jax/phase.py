@@ -34,7 +34,7 @@ def init_phase_params(key, grid_shape, phase_type="grid", initial_guess=None,
         if initial_guess is not None:
             phase0 = jnp.angle(initial_guess)
         else:
-            phase0 = jax.random.uniform(key, grid_shape, minval=0.0, maxval=1.0)
+            phase0 = 1e-3*jax.random.uniform(key, grid_shape, minval=0.0, maxval=1.0)
         return {"phase": phase0}, {"phase_type": "grid"}
 
     if phase_type == "phasor":
