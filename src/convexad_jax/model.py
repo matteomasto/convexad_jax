@@ -155,7 +155,7 @@ def forward(params, coords, Iobs, eps, model_static, stop_amplitude_grad=False):
     # in losses.tv_loss_phase (raw (c,s)-difference smoothness vs.
     # atan2-based wrapped-phase smoothness) -- so this only mattered when
     # beta > 0, but it is a real behavioral mismatch worth fixing.
-    if model_static["phase_type"] in ("phasor"):
+    if model_static["phase_type"] in ("phasor", "displacement"):
         phase = compute_phasor(params["phase"], model_static)
     else:
         phase = compute_phase(params["phase"], model_static)
