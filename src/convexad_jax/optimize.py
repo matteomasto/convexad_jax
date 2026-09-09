@@ -26,8 +26,8 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 import optax
-from jax.flatten_util import ravel_pytree
-import jax.scipy.sparse.linalg as jsla
+# from jax.flatten_util import ravel_pytree
+# import jax.scipy.sparse.linalg as jsla
 
 from .losses import compute_Icalc
 from .model import init_model, init_params_only, make_coords_for, loss_fn, forward
@@ -65,51 +65,38 @@ def init_population(key, n_restarts, grid_shape, N=64, size_factor=4.0,
     params0 = jax.vmap(init_one)(keys)
     return params0, model_static
 
-
-def _solve_one_lbfgs(params0, static, max_steps, tol, memory_size):
-    """Single-instance L-BFGS solve (no leading batch axis)."""
-    solver = optax.lbfgs(memory_size=memory_size)
-
-    def f(p):
-        return loss_fn(p, static)
-
-    value_and_grad = optax.value_and_grad_from_state(f)
-
-    opt_state0 = solver.init(params0)
-    value0, grad0 = value_and_grad(params0, state=opt_state0)
-
-    def cond_fn(carry):
-        step, _params, _state, _value, grad = carry
-        gnorm = optax.tree.norm(grad)
-        return jnp.logical_and(step < max_steps, gnorm > tol)
-
-    def body_fn(carry):
-        step, params, opt_state, value, grad = carry
-        updates, opt_state = solver.update(
-            grad, opt_state, params, value=value, grad=grad, value_fn=f
-        )
-        params = optax.apply_updates(params, updates)
-        value, grad = value_and_grad(params, state=opt_state)
-        return (step + 1, params, opt_state, value, grad)
-
-    init_carry = (jnp.asarray(0), params0, opt_state0, value0, grad0)
-    final_step, final_params, _final_state, final_value, _final_grad = lax.while_loop(
-        cond_fn, body_fn, init_carry
-    )
-    return final_params, final_value, final_step
-
-
 def _solve_one_adam(
     params0, static, max_steps, tol, learning_rate,
     decay_steps=500, decay_rate=0.9, staircase=True,
     b1=0.9, b2=0.98, eps_adam=1e-6,
+    variant="amsgrad",   # NEW: "amsgrad" | "adabelief" | "lion"
 ):
-    """Single-instance Adam(AMSGrad) solve with LR decay, run for a fixed
-    number of steps (or until gradient norm drops below `tol`).
+    """Single-instance solve with LR decay, run for a fixed number of steps
+    (or until gradient norm drops below `tol`).
+
+    variant : "amsgrad" (default) | "adabelief" | "lion"
+        All three are optax.GradientTransformations composed with the same
+        exponential-decay LR schedule, so cond_fn/body_fn below are
+        unchanged regardless of variant.
+        - "amsgrad": current default, unchanged.
+        - "adabelief": scales the step by deviation of the gradient from
+          its own EMA ("belief") rather than raw magnitude -- worth trying
+          given the support gradient's clip-boundary masking (active flag
+          in halfspace_support) makes some voxels' gradients intermittently
+          hard-zero, which AdaBelief may register as "low belief" more
+          precisely than AMSGrad's raw-magnitude second moment does.
+        - "lion": sign-of-momentum updates, no second-moment state at all
+          -- every parameter gets the same step magnitude regardless of
+          its raw gradient scale, which is a more forceful answer to the
+          support/amplitude/phase block-scale disparity than any adaptive
+          second-moment method. Needs its own learning_rate tuning: per
+          the optax docs, Lion's suitable LR is typically 3-10x smaller
+          than Adam's for the same problem -- don't reuse the AMSGrad
+          `learning_rate` value unchanged when testing this variant.
 
     ** Empirical finding, not just a theoretical concern: ** on this
     project's actual loss (MAE has an `abs()` kink; the half-space support
-    has a `clip()` kink), a self-consistency test ... [unchanged docstring]
+    has a `clip()` kink), a self-consistency test ... [unchanged]
     """
     schedule = optax.exponential_decay(
         init_value=learning_rate,
@@ -117,12 +104,17 @@ def _solve_one_adam(
         decay_rate=decay_rate,
         staircase=staircase,
     )
-    # optax.adam has no `amsgrad` flag directly -- chain the AMSGrad
-    # second-moment rule with the same LR schedule TF used.
-    solver = optax.chain(
-        optax.scale_by_amsgrad(b1=b1, b2=b2, eps=eps_adam),
-        optax.scale_by_learning_rate(schedule),
-    )
+
+    if variant == "amsgrad":
+        scale = optax.scale_by_amsgrad(b1=b1, b2=b2, eps=eps_adam)
+    elif variant == "adabelief":
+        scale = optax.scale_by_belief(b1=b1, b2=b2, eps=eps_adam)
+    elif variant == "lion":
+        scale = optax.scale_by_lion(b1=b1, b2=0.99)  # b2 default per optax; b1 shared with caller
+    else:
+        raise ValueError(f"Unknown variant: {variant!r}, choose 'amsgrad', 'adabelief' or 'lion'.")
+
+    solver = optax.chain(scale, optax.scale_by_learning_rate(schedule))
 
     def f(p):
         return loss_fn(p, static)
@@ -162,86 +154,6 @@ def residual_fn(params, static):
     denom = jnp.sum(jnp.sqrt(Iobs))
     return (jnp.sqrt(Iobs) - jnp.sqrt(Icalc)).ravel() / jnp.sqrt(denom)
 
-def _jvp_via_vjp(f_vjp, y_like, v):
-    """Compute J @ v using only reverse-mode AD (a vjp of the vjp).
-    Works even when the forward function contains a custom_vjp with no
-    jvp rule (e.g. halfspace_support's straight-through/clip gradient),
-    where jax.linearize/jax.jvp would raise
-    'can't apply forward-mode autodiff to a custom_vjp function'.
-
-    f_vjp : the linear cotangent -> input map returned by jax.vjp(f, x)
-            (f_vjp(u) = J.T @ u).
-    y_like: any array with the primal output's shape/dtype (just used to
-            seed the zeros for the inner vjp).
-    """
-    def h(u):
-        return f_vjp(u)[0]
-
-    _, h_vjp = jax.vjp(h, jnp.zeros_like(y_like))
-    return h_vjp(v)[0]
-
-
-def _gn_cg_step(params, static, lam, cg_maxiter=30):
-    """One damped Gauss-Newton (Levenberg-Marquardt) step via matrix-free
-    CG. Uses _jvp_via_vjp instead of jax.linearize because the model
-    contains a custom_vjp (halfspace_support) with no forward-mode rule.
-    """
-    flat, unravel = ravel_pytree(params)
-    r_of_flat = lambda p: residual_fn(unravel(p), static)
-
-    r, vjp_fn = jax.vjp(r_of_flat, flat)   # r = r(theta); vjp_fn(u) = (J.T @ u,)
-
-    def JTJ_v(v):
-        Jv = _jvp_via_vjp(vjp_fn, r, v)
-        return vjp_fn(Jv)[0] + lam * v
-
-    rhs = -vjp_fn(r)[0]
-    delta, _ = jsla.cg(JTJ_v, rhs, maxiter=cg_maxiter)
-
-    new_params = unravel(flat + delta)
-    loss_before = loss_fn(params, static)
-    loss_after = loss_fn(new_params, static)
-    improved = loss_after < loss_before
-
-    out_params = jax.tree_util.tree_map(
-        lambda new, old: jnp.where(improved, new, old), new_params, params
-    )
-    new_lam = jnp.where(improved, lam * 0.5, lam * 3.0)
-    out_loss = jnp.where(improved, loss_after, loss_before)
-    return out_params, new_lam, out_loss
-
-def _run_gn_phase(params0, static, n_gn_steps, lam0=1e-3, cg_maxiter=30):
-    def body(_i, carry):
-        params, lam, _loss = carry
-        return _gn_cg_step(params, static, lam, cg_maxiter=cg_maxiter)
-
-    loss0 = loss_fn(params0, static)
-    final_params, final_lam, final_loss = lax.fori_loop(
-        0, n_gn_steps, body, (params0, jnp.asarray(lam0), loss0)
-    )
-    return final_params, final_loss
-
-
-def _solve_one_adam_then_gn(
-    params0, static, n_adam_steps, learning_rate,
-    n_gn_steps, lam0=1e-3, cg_maxiter=30, tol=1e-6,
-):
-    """Adam for `n_adam_steps` to reach a good basin, then `n_gn_steps` of
-    damped Gauss-Newton/LM (matrix-free CG) for a curvature-aware polish.
-    Unlike L-BFGS's secant approximation, GN/LM uses the *exact* local
-    Jacobian (jvp/vjp through the real forward model, including the
-    amplitude(support) coupling when stop_amplitude_grad=False) -- but
-    each step costs cg_maxiter jvp+vjp pairs, so treat this as a short
-    polishing phase, not the main solver.
-    """
-    adam_params, _adam_value, adam_step = _solve_one_adam(
-        params0, static, max_steps=n_adam_steps, tol=tol, learning_rate=learning_rate,
-    )
-    gn_params, gn_value = _run_gn_phase(
-        adam_params, static, n_gn_steps, lam0=lam0, cg_maxiter=cg_maxiter,
-    )
-    return gn_params, gn_value, adam_step + n_gn_steps
-
     
 class ReconstructionResult(NamedTuple):
     best_params: dict          # single-instance pytree (argmin over restarts)
@@ -278,26 +190,19 @@ def reconstruct(
     phase_kwargs=None,
     support_type="single",
     support_kwargs=None,
-    optimizer="adam",
-    max_steps=5000,          # was 300 -- TF ran 5000; cheap under while_loop/vmap
+    max_steps=5000,
     tol=1e-6,
-    memory_size=10,
     learning_rate=0.05,
-    decay_steps=500,         # NEW -- matches TF's ExponentialDecay
-    decay_rate=0.9,          # NEW
-    staircase=True,          # NEW
-    b1=0.9,                  # NEW
-    b2=0.98,                 # NEW -- matches TF (optax default is 0.999)
-    eps_adam=1e-6,           # NEW -- matches TF (optax default is 1e-8)
+    decay_steps=500,
+    decay_rate=0.9,
+    staircase=True,
+    b1=0.9,
+    b2=0.98,
+    eps_adam=1e-6,
     grid_shape=None,
-    stop_amplitude_grad=False,   # NEW
-    n_adam_steps=200,            # NEW -- only used when optimizer="adam_gn"
-    n_gn_steps=20,               # NEW -- only used when optimizer="adam_gn"
-    lm_lambda0=1e-3,             # NEW -- only used when optimizer="adam_gn"
-    cg_maxiter=30,               # NEW -- only used when optimizer="adam_gn"
+    variant="amsgrad",            # "amsgrad" | "adabelief" | "lion"
+    stop_amplitude_grad=False,    # restored
 ):
-
-
     Iobs = jnp.asarray(Iobs, dtype=jnp.float32)
     if grid_shape is None:
         grid_shape, coords = make_coords_for(Iobs.shape)
@@ -319,29 +224,15 @@ def reconstruct(
         "beta": beta,
         "metric": metric,
         "phase_static": model_static,
-        "stop_amplitude_grad": stop_amplitude_grad,   # NEW
+        "stop_amplitude_grad": stop_amplitude_grad,
     }
 
-    if optimizer == "adam":
-        solve = partial(
-            _solve_one_adam, static=static, max_steps=max_steps, tol=tol,
-            learning_rate=learning_rate, decay_steps=decay_steps,
-            decay_rate=decay_rate, staircase=staircase,
-            b1=b1, b2=b2, eps_adam=eps_adam,
-        )
-    elif optimizer == "lbfgs":
-        solve = partial(_solve_one_lbfgs, static=static, max_steps=max_steps,
-                         tol=tol, memory_size=memory_size)
-        
-    elif optimizer == "adam_gn":
-        solve = partial(
-            _solve_one_adam_then_gn, static=static,
-            n_adam_steps=n_adam_steps, learning_rate=learning_rate,
-            n_gn_steps=n_gn_steps, lam0=lm_lambda0, cg_maxiter=cg_maxiter, tol=tol,
+    solve = partial(
+        _solve_one_adam, static=static, max_steps=max_steps, tol=tol,
+        learning_rate=learning_rate, decay_steps=decay_steps,
+        decay_rate=decay_rate, staircase=staircase,
+        b1=b1, b2=b2, eps_adam=eps_adam, variant=variant,
     )
-    else:
-        raise ValueError(f"Unknown optimizer: {optimizer!r}, choose 'adam' or 'lbfgs' or 'adam_gn'.")
-
     batched_solve = jax.vmap(solve, in_axes=(0,))
 
     final_params, final_values, final_steps = batched_solve(params0)
