@@ -34,32 +34,31 @@ def _center_pad(obj, target_shape):
     return jnp.pad(obj, pads)
 
 
-def fourier_loss(support, amplitude, phase, Iobs, metric="mae"):
-    """Forward model (support * amplitude * phasor -> padded FFT -> |.|^2)
-    plus a data-fidelity metric against Iobs.
-    """
+def compute_Icalc(support, amplitude, phase, Iobs):
+    """Forward model only (no metric reduction) -- factored out of
+    fourier_loss so the GN/LM residual can reuse it without duplicating
+    the FFT logic."""
     modulus = support * amplitude
-
     if isinstance(phase, tuple):
         c, s = phase
         obj = jax.lax.complex(modulus * c, modulus * s)
     else:
         obj = jax.lax.complex(modulus * jnp.cos(phase), modulus * jnp.sin(phase))
-
     obj_p = _center_pad(obj, Iobs.shape)
+    Icalc = jnp.abs(jnp.fft.ifftshift(jnp.fft.fftn(jnp.fft.fftshift(obj_p)))) ** 2
+    return Icalc.astype(jnp.float32)
 
-    Icalc = jnp.abs(
-        jnp.fft.ifftshift(jnp.fft.fftn(jnp.fft.fftshift(obj_p)))
-    ) ** 2
 
+def fourier_loss(support, amplitude, phase, Iobs, metric="mae"):
     Iobs = Iobs.astype(jnp.float32)
-    Icalc = Icalc.astype(jnp.float32)
-
+    Icalc = compute_Icalc(support, amplitude, phase, Iobs)
     if metric == "mae":
         return mae(Iobs, Icalc)
+    if metric == "mse":
+        return mse(Iobs, Icalc)
     if metric == "poisson":
         return poisson_kl(Iobs, Icalc)
-    raise ValueError(f"Unknown metric: {metric!r}, choose 'mae' or 'poisson'.")
+    raise ValueError(f"Unknown metric: {metric!r}, choose 'mae', 'mse' or 'poisson'.")
 
 
 def tv_loss_phase(phase, eps=1e-9):

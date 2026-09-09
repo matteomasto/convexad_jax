@@ -26,7 +26,10 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 import optax
+from jax.flatten_util import ravel_pytree
+import jax.scipy.sparse.linalg as jsla
 
+from .losses import compute_Icalc
 from .model import init_model, init_params_only, make_coords_for, loss_fn, forward
 from .support_freeform import init_freeform_support_params, invert_support_to_logit
 
@@ -145,7 +148,85 @@ def _solve_one_adam(
     )
     return final_params, final_value, final_step
 
+def residual_fn(params, static):
+    """Amplitude-domain residual whose sum-of-squares equals `mse`
+    (fidelity term only -- alpha/beta regularizers are not included here).
+    """
+    support, amplitude, phase = forward(
+        params, static["coords"], static["Iobs"], static["eps"],
+        static["phase_static"],
+        stop_amplitude_grad=static.get("stop_amplitude_grad", False),
+    )
+    Iobs = static["Iobs"].astype(jnp.float32)
+    Icalc = compute_Icalc(support, amplitude, phase, Iobs)
+    denom = jnp.sum(jnp.sqrt(Iobs))
+    return (jnp.sqrt(Iobs) - jnp.sqrt(Icalc)).ravel() / jnp.sqrt(denom)
 
+
+def _gn_cg_step(params, static, lam, cg_maxiter=30):
+    """One damped Gauss-Newton (Levenberg-Marquardt) step via matrix-free
+    CG: solves (J^T J + lam*I) delta = -J^T r using only jvp/vjp, never
+    forming J. Accepts the step only if the loss improves; otherwise grows
+    lam and keeps the current params (standard LM trust-region logic).
+    """
+    flat, unravel = ravel_pytree(params)
+    r_of_flat = lambda p: residual_fn(unravel(p), static)
+
+    r, jvp_fn = jax.linearize(r_of_flat, flat)   # r = r(theta); jvp_fn(v) = J @ v
+    _, vjp_fn = jax.vjp(r_of_flat, flat)          # vjp_fn(u) = (J.T @ u,)
+
+    def JTJ_v(v):
+        return vjp_fn(jvp_fn(v))[0] + lam * v
+
+    rhs = -vjp_fn(r)[0]
+    delta, _ = jsla.cg(JTJ_v, rhs, maxiter=cg_maxiter)
+
+    new_params = unravel(flat + delta)
+    loss_before = loss_fn(params, static)
+    loss_after = loss_fn(new_params, static)
+    improved = loss_after < loss_before
+
+    out_params = jax.tree_util.tree_map(
+        lambda new, old: jnp.where(improved, new, old), new_params, params
+    )
+    new_lam = jnp.where(improved, lam * 0.5, lam * 3.0)
+    out_loss = jnp.where(improved, loss_after, loss_before)
+    return out_params, new_lam, out_loss
+
+
+def _run_gn_phase(params0, static, n_gn_steps, lam0=1e-3, cg_maxiter=30):
+    def body(_i, carry):
+        params, lam, _loss = carry
+        return _gn_cg_step(params, static, lam, cg_maxiter=cg_maxiter)
+
+    loss0 = loss_fn(params0, static)
+    final_params, final_lam, final_loss = lax.fori_loop(
+        0, n_gn_steps, body, (params0, jnp.asarray(lam0), loss0)
+    )
+    return final_params, final_loss
+
+
+def _solve_one_adam_then_gn(
+    params0, static, n_adam_steps, learning_rate,
+    n_gn_steps, lam0=1e-3, cg_maxiter=30, tol=1e-6,
+):
+    """Adam for `n_adam_steps` to reach a good basin, then `n_gn_steps` of
+    damped Gauss-Newton/LM (matrix-free CG) for a curvature-aware polish.
+    Unlike L-BFGS's secant approximation, GN/LM uses the *exact* local
+    Jacobian (jvp/vjp through the real forward model, including the
+    amplitude(support) coupling when stop_amplitude_grad=False) -- but
+    each step costs cg_maxiter jvp+vjp pairs, so treat this as a short
+    polishing phase, not the main solver.
+    """
+    adam_params, _adam_value, adam_step = _solve_one_adam(
+        params0, static, max_steps=n_adam_steps, tol=tol, learning_rate=learning_rate,
+    )
+    gn_params, gn_value = _run_gn_phase(
+        adam_params, static, n_gn_steps, lam0=lam0, cg_maxiter=cg_maxiter,
+    )
+    return gn_params, gn_value, adam_step + n_gn_steps
+
+    
 class ReconstructionResult(NamedTuple):
     best_params: dict          # single-instance pytree (argmin over restarts)
     best_loss: jnp.ndarray     # scalar
@@ -230,8 +311,15 @@ def reconstruct(
     elif optimizer == "lbfgs":
         solve = partial(_solve_one_lbfgs, static=static, max_steps=max_steps,
                          tol=tol, memory_size=memory_size)
+        
+    elif optimizer == "adam_gn":
+        solve = partial(
+            _solve_one_adam_then_gn, static=static,
+            n_adam_steps=n_adam_steps, learning_rate=learning_rate,
+            n_gn_steps=n_gn_steps, lam0=lm_lambda0, cg_maxiter=cg_maxiter, tol=tol,
+    )
     else:
-        raise ValueError(f"Unknown optimizer: {optimizer!r}, choose 'adam' or 'lbfgs'.")
+        raise ValueError(f"Unknown optimizer: {optimizer!r}, choose 'adam' or 'lbfgs' or 'adam_gn'.")
 
     batched_solve = jax.vmap(solve, in_axes=(0,))
 

@@ -117,39 +117,10 @@ def _halfspace_support_bwd(res, g):
     def step(dcoords_acc, nd_i):
         n_i, d_i = nd_i
         sigma = _sigma_i(n_i, d_i, coords, eps)
-        # ** Bug fixed here, found by a targeted finite-difference test: **
-        # the forward pass computes log(clip(sigma, 1e-6, 1.0)), so wherever
-        # sigma is clipped the TRUE derivative is exactly zero (a clipped
-        # value doesn't respond to its input at all) -- but this line
-        # previously used the unclipped sigmoid derivative unconditionally,
-        # injecting a small but nonzero spurious gradient into every
-        # saturated ("deep outside" or "deep inside") voxel for every
-        # plane. Verified with sum(S) as an isolating probe (linear in S,
-        # so gS = g*S = S exactly): a plane held deep in saturation across
-        # an entire 20x18x16 grid gave an analytic gradient of 0.0096
-        # (~1.67e-6/voxel) against a finite-difference gradient of exactly
-        # 0. That per-voxel error is small, but it scales with total grid
-        # VOLUME while genuine boundary-driven gradient signal only scales
-        # with grid surface area -- so it is relatively worse at large,
-        # realistic BCDI grid sizes than in small unit tests, even though
-        # it stayed invisible in this project's original (small-grid)
-        # gradient checks.
         active = jnp.logical_and(sigma > 1e-6, sigma < 1.0).astype(sigma.dtype)
         w = gS * active * (1.0 - sigma) / eps    # (D, H, W)
         dd_i = jnp.sum(w)
         dn_i = -jnp.einsum("dhw,dhwc->c", w, coords)
-        # ** Second bug, found integrating multi_support.py: ** this
-        # function used to unconditionally return `None` for the gradient
-        # w.r.t. `coords`, on the assumption that `coords` is always a
-        # fixed, non-trainable grid. That's true for the single-part
-        # support in this file, but multi_support.py passes
-        # `coords - centers` (a per-part, per-voxel shift by a TRAINABLE
-        # center), so the `None` was silently discarding the gradient path
-        # to `centers` entirely -- confirmed by a finite-difference check
-        # that found `centers`' analytic gradient was exactly 0 where it
-        # should have been -15.8. d(log sigma_i)/dx = -(1-sigma_i)*n_i/eps
-        # (chain rule through z_i = (d_i - n_i.x)/eps), so the per-voxel
-        # contribution to d(coords) is `-w * n_i`, accumulated over planes.
         dcoords_acc = dcoords_acc - w[..., None] * n_i   # (D, H, W, 3)
         return dcoords_acc, (dn_i, dd_i)
 

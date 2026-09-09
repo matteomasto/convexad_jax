@@ -111,14 +111,17 @@ def init_params_only(key, grid_shape, N=64, size_factor=4.0, phase_type="grid",
     return params
 
 
-def _amplitude_from(support, Iobs, eps=1e-12):
+def _amplitude_from(support, Iobs, eps=1e-12, stop_grad=False):
     N = Iobs.size
     sum_I = jnp.sum(Iobs)
     sum_S = jnp.sum(support ** 2)
-    return jnp.sqrt(sum_I / (N * sum_S + eps))
+    amplitude = jnp.sqrt(sum_I / (N * sum_S + eps))
+    if stop_grad:
+        amplitude = jax.lax.stop_gradient(amplitude)
+    return amplitude
 
 
-def forward(params, coords, Iobs, eps, model_static):
+def forward(params, coords, Iobs, eps, model_static, stop_amplitude_grad=False):
     """Single-instance forward pass.
 
     Returns (support, amplitude, phase_or_phasor) exactly like the original
@@ -138,7 +141,7 @@ def forward(params, coords, Iobs, eps, model_static):
     else:
         support = compute_support(params["support"], coords, eps)
 
-    amplitude = _amplitude_from(support, Iobs)
+    amplitude = _amplitude_from(support, Iobs, stop_grad=stop_amplitude_grad)
 
     # Bug fixed here, found by re-checking against the original phase.py:
     # the original dispatches on `hasattr(self.phaser, "compute_phasor")`,
@@ -183,7 +186,7 @@ def loss_fn(params, static):
     "multi" call sites that never set them are unaffected.
     """
     support, amplitude, phase = forward(
-        params, static["coords"], static["Iobs"], static["eps"], static["phase_static"]
+        params, static["coords"], static["Iobs"], static["eps"], static["phase_static"], stop_amplitude_grad=static.get("stop_amplitude_grad", False),
     )
     return total_loss(
         support, amplitude, phase, static["Iobs"],
