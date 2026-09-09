@@ -162,21 +162,38 @@ def residual_fn(params, static):
     denom = jnp.sum(jnp.sqrt(Iobs))
     return (jnp.sqrt(Iobs) - jnp.sqrt(Icalc)).ravel() / jnp.sqrt(denom)
 
+def _jvp_via_vjp(f_vjp, y_like, v):
+    """Compute J @ v using only reverse-mode AD (a vjp of the vjp).
+    Works even when the forward function contains a custom_vjp with no
+    jvp rule (e.g. halfspace_support's straight-through/clip gradient),
+    where jax.linearize/jax.jvp would raise
+    'can't apply forward-mode autodiff to a custom_vjp function'.
+
+    f_vjp : the linear cotangent -> input map returned by jax.vjp(f, x)
+            (f_vjp(u) = J.T @ u).
+    y_like: any array with the primal output's shape/dtype (just used to
+            seed the zeros for the inner vjp).
+    """
+    def h(u):
+        return f_vjp(u)[0]
+
+    _, h_vjp = jax.vjp(h, jnp.zeros_like(y_like))
+    return h_vjp(v)[0]
+
 
 def _gn_cg_step(params, static, lam, cg_maxiter=30):
     """One damped Gauss-Newton (Levenberg-Marquardt) step via matrix-free
-    CG: solves (J^T J + lam*I) delta = -J^T r using only jvp/vjp, never
-    forming J. Accepts the step only if the loss improves; otherwise grows
-    lam and keeps the current params (standard LM trust-region logic).
+    CG. Uses _jvp_via_vjp instead of jax.linearize because the model
+    contains a custom_vjp (halfspace_support) with no forward-mode rule.
     """
     flat, unravel = ravel_pytree(params)
     r_of_flat = lambda p: residual_fn(unravel(p), static)
 
-    r, jvp_fn = jax.linearize(r_of_flat, flat)   # r = r(theta); jvp_fn(v) = J @ v
-    _, vjp_fn = jax.vjp(r_of_flat, flat)          # vjp_fn(u) = (J.T @ u,)
+    r, vjp_fn = jax.vjp(r_of_flat, flat)   # r = r(theta); vjp_fn(u) = (J.T @ u,)
 
     def JTJ_v(v):
-        return vjp_fn(jvp_fn(v))[0] + lam * v
+        Jv = _jvp_via_vjp(vjp_fn, r, v)
+        return vjp_fn(Jv)[0] + lam * v
 
     rhs = -vjp_fn(r)[0]
     delta, _ = jsla.cg(JTJ_v, rhs, maxiter=cg_maxiter)
@@ -192,7 +209,6 @@ def _gn_cg_step(params, static, lam, cg_maxiter=30):
     new_lam = jnp.where(improved, lam * 0.5, lam * 3.0)
     out_loss = jnp.where(improved, loss_after, loss_before)
     return out_params, new_lam, out_loss
-
 
 def _run_gn_phase(params0, static, n_gn_steps, lam0=1e-3, cg_maxiter=30):
     def body(_i, carry):
