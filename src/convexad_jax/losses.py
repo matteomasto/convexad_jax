@@ -22,23 +22,18 @@ def mse(Iobs, Icalc):
 def poisson_kl(Iobs, Icalc, eps=1.0):
     """Poisson KL divergence, averaged per voxel.
 
-    Uses jax.scipy.special.xlogy(Iobs, ratio) instead of a manual
-    jnp.where(Iobs > 0, Iobs*jnp.log(ratio), 0.0) -- the manual version
-    masks the FORWARD value correctly but not the gradient (autodiff
-    differentiates both branches of `where` before selecting, so
-    log(ratio)'s -inf at Iobs=0 pixels still poisons the gradient via
-    0*inf=NaN). xlogy has a custom derivative rule specifically designed
-    to avoid this at x=0, mirroring tf.math.xlogy's behavior in the
-    original TF implementation.
-
-    The Icalc floor (`eps`) is kept regardless: it protects against a
-    DIFFERENT divergence (Icalc->0 while Iobs>0, where d(kl)/dIcalc ~
-    Iobs/Icalc blows up) that xlogy does not address, and guards against
-    xlogy's own residual weak spot when x=0 AND y=0 simultaneously (see
-    jax-ml/jax#15709) by keeping Icalc_safe away from exact zero.
+    ** Third bug fixed here: ** xlogy(Iobs, ratio) is safe at (0,0) for
+    its FORWARD value, but its JVP rule (x_dot*log(y) + y_dot*x/y) uses
+    the raw x/y, not an internally-masked version -- and in this exact
+    composition, ratio=Iobs/Icalc_safe is deterministically 0 whenever
+    Iobs=0 (not a rare coincidence), so every zero-count pixel hits
+    xlogy's own 0/0 gradient term. Mask `ratio` itself to a safe nonzero
+    value at Iobs=0 BEFORE calling xlogy -- xlogy(0, 1.0) still correctly
+    returns 0 for the forward value, and its gradient term becomes
+    0*log(1) + y_dot*0/1 = 0, finite.
     """
     Icalc_safe = jnp.clip(Icalc, eps, None)
-    ratio = Iobs / Icalc_safe
+    ratio = jnp.where(Iobs > 0, Iobs / Icalc_safe, 1.0)
     kl = Icalc - Iobs + jax.scipy.special.xlogy(Iobs, ratio)
     N = Iobs.size
     return jnp.sum(kl) / N
