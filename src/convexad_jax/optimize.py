@@ -29,7 +29,7 @@ import optax
 # from jax.flatten_util import ravel_pytree
 # import jax.scipy.sparse.linalg as jsla
 
-from .losses import compute_Icalc
+from .losses import compute_Icalc, _center_pad
 from .model import init_model, init_params_only, make_coords_for, loss_fn, forward
 from .support_freeform import init_freeform_support_params, invert_support_to_logit
 
@@ -64,45 +64,177 @@ def init_population(key, n_restarts, grid_shape, N=64, size_factor=4.0,
     )
     params0 = jax.vmap(init_one)(keys)
     return params0, model_static
+    
+def _newton_step_size(params, grad, direction, static, schedule_alpha, alpha_max=10.0):
+    """Bilinear-Hessian Newton step size (Carlsson et al., eq. 20) for the
+    descent direction `s = -direction` (direction is the raw AMSGrad/
+    AdaBelief/Lion-preconditioned gradient, same sign as `grad`, i.e. NOT
+    yet a descent direction -- optax's scale_by_* transforms don't negate;
+    only scale_by_learning_rate does).
+
+    alpha = -<grad, s> / H|params(s, s)
+
+    H is computed exactly for the o -> Icalc -> metric layers (closed
+    form, one extra FFT via jax.jvp through the theta->o map -- the
+    parametrization layer, support/phase, is handled by ordinary JAX AD;
+    see the "hybrid" recipe discussed for _gn_cg_step). alpha/beta
+    regularizer curvature is NOT included (their contribution is usually
+    small; alpha=0 in your current runs makes this moot for that term).
+
+    metric='mae' is not supported: its bilinear Hessian is 0 a.e. (mae's
+    h''(I)=0 except at the single non-differentiable point I=Iobs) --
+    the Newton rule is undefined for it by construction, not a missing
+    feature.
+
+    Falls back to `schedule_alpha` (the exponential-decay schedule's
+    current value) whenever H(s,s) <= 0 (local non-convexity along s,
+    expected especially early in optimization) or the result isn't
+    finite, and always clips to `alpha_max` as a guard against a
+    near-zero H(s,s) blowing the step up.
+    """
+    metric = static["metric"]
+    if metric not in ("mse", "poisson"):
+        raise ValueError(
+            f"Newton step size only supports metric='mse' or 'poisson' "
+            f"(mae's bilinear Hessian is 0 a.e.), got {metric!r}."
+        )
+
+    s = jax.tree_util.tree_map(lambda d: -d, direction)  # actual descent direction
+
+    def field_fn(p):
+        support, amplitude, phase = forward(
+            p, static["coords"], static["Iobs"], static["eps"],
+            static["phase_static"],
+            stop_amplitude_grad=static.get("stop_amplitude_grad", False),
+        )
+        modulus = support * amplitude
+        if isinstance(phase, tuple):
+            c, sn = phase
+            return jax.lax.complex(modulus * c, modulus * sn)
+        return jax.lax.complex(modulus * jnp.cos(phase), modulus * jnp.sin(phase))
+
+    o, delta_o = jax.jvp(field_fn, (params,), (s,))
+    Iobs = static["Iobs"].astype(jnp.float32)
+    o_p = _center_pad(o, Iobs.shape)
+    do_p = _center_pad(delta_o, Iobs.shape)
+
+    z   = jnp.fft.ifftshift(jnp.fft.fftn(jnp.fft.fftshift(o_p)))
+    Fdo = jnp.fft.ifftshift(jnp.fft.fftn(jnp.fft.fftshift(do_p)))
+
+    Icalc   = jnp.abs(z) ** 2
+    dIcalc  = 2.0 * jnp.real(jnp.conj(z) * Fdo)   # dIcalc|_o(delta_o)
+    d2Icalc = 2.0 * jnp.abs(Fdo) ** 2              # d^2Icalc|_o(delta_o, delta_o) -- exact
+
+    if metric == "mse":
+        D_norm = jnp.sum(jnp.sqrt(Iobs))
+        r = jnp.sqrt(Iobs) - jnp.sqrt(jnp.clip(Icalc, 1e-12, None))
+        sqrtI = jnp.sqrt(jnp.clip(Icalc, 1e-12, None))
+        h_prime = -r / (D_norm * sqrtI)
+        h_double_prime = jnp.sqrt(Iobs) / (2.0 * D_norm * sqrtI ** 3)
+    else:  # "poisson"
+        N = Iobs.size
+        Icalc_safe = jnp.clip(Icalc, 1e-12, None)
+        h_prime = (1.0 - Iobs / Icalc_safe) / N
+        h_double_prime = (Iobs / Icalc_safe ** 2) / N
+
+    HH = jnp.sum(h_double_prime * dIcalc ** 2 + h_prime * d2Icalc)
+
+    grad_dot_s = sum(
+        jnp.sum(g * si) for g, si in zip(
+            jax.tree_util.tree_leaves(grad), jax.tree_util.tree_leaves(s)
+        )
+    )
+    alpha_newton = -grad_dot_s / HH
+
+    valid = jnp.logical_and(HH > 0, jnp.isfinite(alpha_newton))
+    return jnp.where(valid, jnp.clip(alpha_newton, 0.0, alpha_max), schedule_alpha)
+    
+# def _solve_one_adam(
+#     params0, static, max_steps, tol, learning_rate,
+#     decay_steps=500, decay_rate=0.9, staircase=True,
+#     b1=0.9, b2=0.98, eps_adam=1e-6,
+#     variant="amsgrad",   # NEW: "amsgrad" | "adabelief" | "lion"
+# ):
+#     """Single-instance solve with LR decay, run for a fixed number of steps
+#     (or until gradient norm drops below `tol`).
+
+#     variant : "amsgrad" (default) | "adabelief" | "lion"
+#         All three are optax.GradientTransformations composed with the same
+#         exponential-decay LR schedule, so cond_fn/body_fn below are
+#         unchanged regardless of variant.
+#         - "amsgrad": current default, unchanged.
+#         - "adabelief": scales the step by deviation of the gradient from
+#           its own EMA ("belief") rather than raw magnitude -- worth trying
+#           given the support gradient's clip-boundary masking (active flag
+#           in halfspace_support) makes some voxels' gradients intermittently
+#           hard-zero, which AdaBelief may register as "low belief" more
+#           precisely than AMSGrad's raw-magnitude second moment does.
+#         - "lion": sign-of-momentum updates, no second-moment state at all
+#           -- every parameter gets the same step magnitude regardless of
+#           its raw gradient scale, which is a more forceful answer to the
+#           support/amplitude/phase block-scale disparity than any adaptive
+#           second-moment method. Needs its own learning_rate tuning: per
+#           the optax docs, Lion's suitable LR is typically 3-10x smaller
+#           than Adam's for the same problem -- don't reuse the AMSGrad
+#           `learning_rate` value unchanged when testing this variant.
+
+#     ** Empirical finding, not just a theoretical concern: ** on this
+#     project's actual loss (MAE has an `abs()` kink; the half-space support
+#     has a `clip()` kink), a self-consistency test ... [unchanged]
+#     """
+#     schedule = optax.exponential_decay(
+#         init_value=learning_rate,
+#         transition_steps=decay_steps,
+#         decay_rate=decay_rate,
+#         staircase=staircase,
+#     )
+
+#     if variant == "amsgrad":
+#         scale = optax.scale_by_amsgrad(b1=b1, b2=b2, eps=eps_adam)
+#     elif variant == "adabelief":
+#         scale = optax.scale_by_belief(b1=b1, b2=b2, eps=eps_adam)
+#     elif variant == "lion":
+#         scale = optax.scale_by_lion(b1=b1, b2=0.99)  # b2 default per optax; b1 shared with caller
+#     else:
+#         raise ValueError(f"Unknown variant: {variant!r}, choose 'amsgrad', 'adabelief' or 'lion'.")
+
+#     solver = optax.chain(scale, optax.scale_by_learning_rate(schedule))
+
+#     def f(p):
+#         return loss_fn(p, static)
+
+#     opt_state0 = solver.init(params0)
+#     value0, grad0 = jax.value_and_grad(f)(params0)
+
+#     def cond_fn(carry):
+#         step, _params, _state, _value, grad = carry
+#         gnorm = optax.tree.norm(grad)
+#         return jnp.logical_and(step < max_steps, gnorm > tol)
+
+#     def body_fn(carry):
+#         step, params, opt_state, value, grad = carry
+#         updates, opt_state = solver.update(grad, opt_state, params)
+#         params = optax.apply_updates(params, updates)
+#         value, grad = jax.value_and_grad(f)(params)
+#         return (step + 1, params, opt_state, value, grad)
+
+#     init_carry = (jnp.asarray(0), params0, opt_state0, value0, grad0)
+#     final_step, final_params, _final_state, final_value, _final_grad = lax.while_loop(
+#         cond_fn, body_fn, init_carry
+#     )
+#     return final_params, final_value, final_step
 
 def _solve_one_adam(
     params0, static, max_steps, tol, learning_rate,
     decay_steps=500, decay_rate=0.9, staircase=True,
     b1=0.9, b2=0.98, eps_adam=1e-6,
-    variant="amsgrad",   # NEW: "amsgrad" | "adabelief" | "lion"
+    variant="amsgrad",
+    newton_step_size=False,     # NEW
+    newton_alpha_max=10.0,      # NEW
 ):
-    """Single-instance solve with LR decay, run for a fixed number of steps
-    (or until gradient norm drops below `tol`).
-
-    variant : "amsgrad" (default) | "adabelief" | "lion"
-        All three are optax.GradientTransformations composed with the same
-        exponential-decay LR schedule, so cond_fn/body_fn below are
-        unchanged regardless of variant.
-        - "amsgrad": current default, unchanged.
-        - "adabelief": scales the step by deviation of the gradient from
-          its own EMA ("belief") rather than raw magnitude -- worth trying
-          given the support gradient's clip-boundary masking (active flag
-          in halfspace_support) makes some voxels' gradients intermittently
-          hard-zero, which AdaBelief may register as "low belief" more
-          precisely than AMSGrad's raw-magnitude second moment does.
-        - "lion": sign-of-momentum updates, no second-moment state at all
-          -- every parameter gets the same step magnitude regardless of
-          its raw gradient scale, which is a more forceful answer to the
-          support/amplitude/phase block-scale disparity than any adaptive
-          second-moment method. Needs its own learning_rate tuning: per
-          the optax docs, Lion's suitable LR is typically 3-10x smaller
-          than Adam's for the same problem -- don't reuse the AMSGrad
-          `learning_rate` value unchanged when testing this variant.
-
-    ** Empirical finding, not just a theoretical concern: ** on this
-    project's actual loss (MAE has an `abs()` kink; the half-space support
-    has a `clip()` kink), a self-consistency test ... [unchanged]
-    """
     schedule = optax.exponential_decay(
-        init_value=learning_rate,
-        transition_steps=decay_steps,
-        decay_rate=decay_rate,
-        staircase=staircase,
+        init_value=learning_rate, transition_steps=decay_steps,
+        decay_rate=decay_rate, staircase=staircase,
     )
 
     if variant == "amsgrad":
@@ -110,11 +242,13 @@ def _solve_one_adam(
     elif variant == "adabelief":
         scale = optax.scale_by_belief(b1=b1, b2=b2, eps=eps_adam)
     elif variant == "lion":
-        scale = optax.scale_by_lion(b1=b1, b2=0.99)  # b2 default per optax; b1 shared with caller
+        scale = optax.scale_by_lion(b1=b1, b2=0.99)
     else:
         raise ValueError(f"Unknown variant: {variant!r}, choose 'amsgrad', 'adabelief' or 'lion'.")
 
-    solver = optax.chain(scale, optax.scale_by_learning_rate(schedule))
+    # direction-only solver when using Newton step size; otherwise chain
+    # the schedule in as before (unchanged default behavior).
+    solver = scale if newton_step_size else optax.chain(scale, optax.scale_by_learning_rate(schedule))
 
     def f(p):
         return loss_fn(p, static)
@@ -124,12 +258,21 @@ def _solve_one_adam(
 
     def cond_fn(carry):
         step, _params, _state, _value, grad = carry
-        gnorm = optax.tree.norm(grad)
-        return jnp.logical_and(step < max_steps, gnorm > tol)
+        return jnp.logical_and(step < max_steps, optax.tree.norm(grad) > tol)
 
     def body_fn(carry):
         step, params, opt_state, value, grad = carry
-        updates, opt_state = solver.update(grad, opt_state, params)
+        direction, opt_state = solver.update(grad, opt_state, params)
+
+        if newton_step_size:
+            schedule_alpha = schedule(step)
+            alpha = _newton_step_size(
+                params, grad, direction, static, schedule_alpha, alpha_max=newton_alpha_max
+            )
+            updates = jax.tree_util.tree_map(lambda d: -alpha * d, direction)
+        else:
+            updates = direction  # schedule's -lr already baked in via scale_by_learning_rate
+
         params = optax.apply_updates(params, updates)
         value, grad = jax.value_and_grad(f)(params)
         return (step + 1, params, opt_state, value, grad)
@@ -139,7 +282,7 @@ def _solve_one_adam(
         cond_fn, body_fn, init_carry
     )
     return final_params, final_value, final_step
-
+    
 def residual_fn(params, static):
     """Amplitude-domain residual whose sum-of-squares equals `mse`
     (fidelity term only -- alpha/beta regularizers are not included here).
@@ -202,6 +345,8 @@ def reconstruct(
     grid_shape=None,
     variant="amsgrad",            # "amsgrad" | "adabelief" | "lion"
     stop_amplitude_grad=False,    # restored
+    newton_step_size=False,     # NEW
+    newton_alpha_max=10.0,      # NEW
 ):
     Iobs = jnp.asarray(Iobs, dtype=jnp.float32)
     if grid_shape is None:
@@ -232,6 +377,7 @@ def reconstruct(
         learning_rate=learning_rate, decay_steps=decay_steps,
         decay_rate=decay_rate, staircase=staircase,
         b1=b1, b2=b2, eps_adam=eps_adam, variant=variant,
+        newton_step_size=newton_step_size, newton_alpha_max=newton_alpha_max,
     )
     batched_solve = jax.vmap(solve, in_axes=(0,))
 
