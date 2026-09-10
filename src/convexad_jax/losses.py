@@ -19,9 +19,11 @@ def mse(Iobs, Icalc):
     """Normalized mean squared error."""
     return jnp.sum((jnp.sqrt(Iobs) - jnp.sqrt(Icalc))**2) / jnp.sum(jnp.sqrt(Iobs))
     
-def poisson_kl(Iobs, Icalc, eps=1e-12):
-    """Poisson KL divergence, averaged per voxel."""
-    ratio = Iobs / (Icalc + eps)
+def poisson_kl(Iobs, Icalc, eps=1.0):
+    """Poisson KL divergence, averaged per voxel.
+    """
+    Icalc_safe = jnp.clip(Icalc, eps, None)
+    ratio = Iobs / Icalc_safe
     kl = Icalc - Iobs + jnp.where(Iobs > 0, Iobs * jnp.log(ratio), 0.0)
     N = Iobs.size
     return jnp.sum(kl) / N
