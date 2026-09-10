@@ -241,8 +241,8 @@ def _solve_one_adam(
     decay_steps=500, decay_rate=0.9, staircase=True,
     b1=0.9, b2=0.98, eps_adam=1e-6,
     variant="amsgrad",
-    clip_norm=None,       # NEW -- global gradient-norm clip, applied before scale_by_*
-    sign_grad=False,      # NEW -- use sign(grad) as the direction fed to scale_by_*
+    clip_norm=None,       # global gradient-norm clip, applied before scale_by_*
+    sign_grad=False,      # use sign(grad) as the direction fed to scale_by_*
 ):
     """... existing docstring ...
 
@@ -252,7 +252,7 @@ def _solve_one_adam(
         gradient regardless of how wrong the current point is, testing
         whether `mae`+Adam's advantage on this landscape is really "bounded
         step size" rather than anything MAE-specific. Composes with any
-        `variant` and with `newton_step_size` (clip -> scale -> [schedule]).
+        `variant`.
     sign_grad : bool
         If True, replaces the gradient with elementwise sign(grad) before
         it reaches scale_by_*, i.e. every voxel/parameter contributes a
@@ -263,10 +263,6 @@ def _solve_one_adam(
         no-op on magnitude; apply clip_norm to the raw gradient, sign_grad
         replaces it entirely -- if both are set, sign_grad wins, since
         clipping a vector of +-1's does nothing meaningful).
-        Newton step size, if also enabled, still uses the TRUE (untouched)
-        gradient for its optimality condition -- only the direction fed
-        to solver.update is affected by sign_grad/clip_norm; alpha's
-        derivation assumes the real gradient, not a modified stand-in.
     """
     schedule = optax.exponential_decay(
         init_value=learning_rate, transition_steps=decay_steps,
@@ -297,8 +293,6 @@ def _solve_one_adam(
 
     def cond_fn(carry):
         step, _params, _state, _value, grad = carry
-        # convergence criterion always uses the TRUE gradient norm, even
-        # when sign_grad reshapes what's actually fed to the optimizer
         return jnp.logical_and(step < max_steps, optax.tree.norm(grad) > tol)
 
     def body_fn(carry):
@@ -309,7 +303,7 @@ def _solve_one_adam(
         )
         direction, opt_state = solver.update(grad_for_update, opt_state, params)
 
-        params = optax.apply_updates(params, updates)
+        params = optax.apply_updates(params, direction)   # was: `updates` (undefined)
         value, grad = jax.value_and_grad(f)(params)
         return (step + 1, params, opt_state, value, grad)
 
