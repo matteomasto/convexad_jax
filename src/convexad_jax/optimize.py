@@ -241,10 +241,6 @@ def _solve_one_adam(
     decay_steps=500, decay_rate=0.9, staircase=True,
     b1=0.9, b2=0.98, eps_adam=1e-6,
     variant="amsgrad",
-    newton_step_size=False,
-    newton_alpha_multiplier=5.0,
-    newton_intensity_floor=1.0,
-    newton_max_backtracks=4,
     clip_norm=None,       # NEW -- global gradient-norm clip, applied before scale_by_*
     sign_grad=False,      # NEW -- use sign(grad) as the direction fed to scale_by_*
 ):
@@ -290,8 +286,7 @@ def _solve_one_adam(
     if clip_norm is not None:
         transforms.append(optax.clip_by_global_norm(clip_norm))
     transforms.append(scale)
-    if not newton_step_size:
-        transforms.append(optax.scale_by_learning_rate(schedule))
+    transforms.append(optax.scale_by_learning_rate(schedule))
     solver = optax.chain(*transforms)
 
     def f(p):
@@ -313,34 +308,6 @@ def _solve_one_adam(
             jax.tree_util.tree_map(jnp.sign, grad) if sign_grad else grad
         )
         direction, opt_state = solver.update(grad_for_update, opt_state, params)
-
-        if newton_step_size:
-            schedule_alpha = schedule(step)
-            alpha0 = _newton_step_size(
-                params, grad, direction, static, schedule_alpha,   # true `grad`, not grad_for_update
-                alpha_multiplier=newton_alpha_multiplier,
-                intensity_floor=newton_intensity_floor,
-            )
-
-            def try_params(a):
-                upd = jax.tree_util.tree_map(lambda d: -a * d, direction)
-                return optax.apply_updates(params, upd)
-
-            def bt_cond(c):
-                i, _a, improved = c
-                return jnp.logical_and(i < newton_max_backtracks, jnp.logical_not(improved))
-
-            def bt_body(c):
-                i, a, _improved = c
-                candidate_loss = loss_fn(try_params(a), static)
-                improved = candidate_loss < value
-                return (i + 1, jnp.where(improved, a, a * 0.5), improved)
-
-            _i, alpha_bt, improved = lax.while_loop(bt_cond, bt_body, (0, alpha0, False))
-            alpha = jnp.where(improved, alpha_bt, schedule_alpha)
-            updates = jax.tree_util.tree_map(lambda d: -alpha * d, direction)
-        else:
-            updates = direction
 
         params = optax.apply_updates(params, updates)
         value, grad = jax.value_and_grad(f)(params)
@@ -440,7 +407,7 @@ def reconstruct(
         learning_rate=learning_rate, decay_steps=decay_steps,
         decay_rate=decay_rate, staircase=staircase,
         b1=b1, b2=b2, eps_adam=eps_adam, variant=variant,
-        newton_step_size=newton_step_size, clip_norm=clip_norm, sign_grad=sign_grad,
+        clip_norm=clip_norm, sign_grad=sign_grad,
     )
     batched_solve = jax.vmap(solve, in_axes=(0,))
 
