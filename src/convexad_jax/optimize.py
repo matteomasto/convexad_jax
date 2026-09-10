@@ -78,88 +78,88 @@ def _jvp_via_vjp(f_vjp, y_like, v):
     return h_vjp(v)[0]
 
 
-def _newton_step_size(params, grad, direction, static, schedule_alpha, alpha_multiplier=5.0):
-    """Bilinear-Hessian Newton step size (Carlsson et al. 2025, eq. 20):
-    alpha = -<grad, s> / H|params(s, s), s = -direction.
+# def _newton_step_size(params, grad, direction, static, schedule_alpha, alpha_multiplier=5.0):
+#     """Bilinear-Hessian Newton step size (Carlsson et al. 2025, eq. 20):
+#     alpha = -<grad, s> / H|params(s, s), s = -direction.
 
-    H is exact for o -> Icalc -> metric (closed form, one extra FFT); the
-    params -> o layer (support's halfspace_support, amplitude's Parseval
-    normalization, phase's Qnorm*u or phasor) goes through _jvp_via_vjp on
-    the SAME forward() grad already uses -- Qnorm's chain-rule contribution
-    is picked up automatically and exactly, no special-casing needed for
-    phase_type="displacement". See module notes on why this is safe to mix
-    with Qnorm's existing benefit under AMSGrad, and the one real caveat:
-    alpha is a single global scalar over the whole (support, phase)
-    direction, not a per-block step size.
+#     H is exact for o -> Icalc -> metric (closed form, one extra FFT); the
+#     params -> o layer (support's halfspace_support, amplitude's Parseval
+#     normalization, phase's Qnorm*u or phasor) goes through _jvp_via_vjp on
+#     the SAME forward() grad already uses -- Qnorm's chain-rule contribution
+#     is picked up automatically and exactly, no special-casing needed for
+#     phase_type="displacement". See module notes on why this is safe to mix
+#     with Qnorm's existing benefit under AMSGrad, and the one real caveat:
+#     alpha is a single global scalar over the whole (support, phase)
+#     direction, not a per-block step size.
 
-    metric must be 'mse' or 'poisson' -- matches losses.mse (sqrt/amplitude
-    domain) and losses.poisson_kl (raw intensity domain) exactly, each in
-    its own correct domain. 'mae' is unsupported: h''(I)=0 a.e. for it.
+#     metric must be 'mse' or 'poisson' -- matches losses.mse (sqrt/amplitude
+#     domain) and losses.poisson_kl (raw intensity domain) exactly, each in
+#     its own correct domain. 'mae' is unsupported: h''(I)=0 a.e. for it.
 
-    Falls back to `schedule_alpha` when H(s,s) <= 0 or the result isn't
-    finite; alpha_max = alpha_multiplier * schedule_alpha (dynamic, tied
-    to the schedule's current value rather than a fixed constant).
-    """
-    metric = static["metric"]
-    if metric not in ("mse", "poisson"):
-        raise ValueError(
-            f"Newton step size only supports metric='mse' or 'poisson' "
-            f"(mae's bilinear Hessian is 0 a.e.), got {metric!r}."
-        )
+#     Falls back to `schedule_alpha` when H(s,s) <= 0 or the result isn't
+#     finite; alpha_max = alpha_multiplier * schedule_alpha (dynamic, tied
+#     to the schedule's current value rather than a fixed constant).
+#     """
+#     metric = static["metric"]
+#     if metric not in ("mse", "poisson"):
+#         raise ValueError(
+#             f"Newton step size only supports metric='mse' or 'poisson' "
+#             f"(mae's bilinear Hessian is 0 a.e.), got {metric!r}."
+#         )
 
-    s = jax.tree_util.tree_map(lambda d: -d, direction)
+#     s = jax.tree_util.tree_map(lambda d: -d, direction)
 
-    def field_fn(p):
-        support, amplitude, phase = forward(
-            p, static["coords"], static["Iobs"], static["eps"],
-            static["phase_static"],
-            stop_amplitude_grad=static.get("stop_amplitude_grad", False),
-        )
-        modulus = support * amplitude
-        if isinstance(phase, tuple):
-            c, sn = phase
-            return jax.lax.complex(modulus * c, modulus * sn)
-        return jax.lax.complex(modulus * jnp.cos(phase), modulus * jnp.sin(phase))
+#     def field_fn(p):
+#         support, amplitude, phase = forward(
+#             p, static["coords"], static["Iobs"], static["eps"],
+#             static["phase_static"],
+#             stop_amplitude_grad=static.get("stop_amplitude_grad", False),
+#         )
+#         modulus = support * amplitude
+#         if isinstance(phase, tuple):
+#             c, sn = phase
+#             return jax.lax.complex(modulus * c, modulus * sn)
+#         return jax.lax.complex(modulus * jnp.cos(phase), modulus * jnp.sin(phase))
 
-    o, field_vjp = jax.vjp(field_fn, params)
-    delta_o = _jvp_via_vjp(field_vjp, o, s)
+#     o, field_vjp = jax.vjp(field_fn, params)
+#     delta_o = _jvp_via_vjp(field_vjp, o, s)
 
-    Iobs = static["Iobs"].astype(jnp.float32)
-    o_p = _center_pad(o, Iobs.shape)
-    do_p = _center_pad(delta_o, Iobs.shape)
+#     Iobs = static["Iobs"].astype(jnp.float32)
+#     o_p = _center_pad(o, Iobs.shape)
+#     do_p = _center_pad(delta_o, Iobs.shape)
 
-    z   = jnp.fft.ifftshift(jnp.fft.fftn(jnp.fft.fftshift(o_p)))
-    Fdo = jnp.fft.ifftshift(jnp.fft.fftn(jnp.fft.fftshift(do_p)))
+#     z   = jnp.fft.ifftshift(jnp.fft.fftn(jnp.fft.fftshift(o_p)))
+#     Fdo = jnp.fft.ifftshift(jnp.fft.fftn(jnp.fft.fftshift(do_p)))
 
-    Icalc   = jnp.abs(z) ** 2
-    dIcalc  = 2.0 * jnp.real(jnp.conj(z) * Fdo)
-    d2Icalc = 2.0 * jnp.abs(Fdo) ** 2
+#     Icalc   = jnp.abs(z) ** 2
+#     dIcalc  = 2.0 * jnp.real(jnp.conj(z) * Fdo)
+#     d2Icalc = 2.0 * jnp.abs(Fdo) ** 2
 
-    if metric == "mse":
-        D_norm = jnp.sum(jnp.sqrt(Iobs))
-        Icalc_safe = jnp.clip(Icalc, 1e-12, None)
-        sqrtI = jnp.sqrt(Icalc_safe)
-        r = jnp.sqrt(Iobs) - sqrtI
-        h_prime = -r / (D_norm * sqrtI)
-        h_double_prime = jnp.sqrt(Iobs) / (2.0 * D_norm * sqrtI ** 3)
-    else:  # "poisson"
-        N = Iobs.size
-        Icalc_safe = jnp.clip(Icalc, 1e-12, None)
-        h_prime = (1.0 - Iobs / Icalc_safe) / N
-        h_double_prime = (Iobs / Icalc_safe ** 2) / N
+#     if metric == "mse":
+#         D_norm = jnp.sum(jnp.sqrt(Iobs))
+#         Icalc_safe = jnp.clip(Icalc, 1e-12, None)
+#         sqrtI = jnp.sqrt(Icalc_safe)
+#         r = jnp.sqrt(Iobs) - sqrtI
+#         h_prime = -r / (D_norm * sqrtI)
+#         h_double_prime = jnp.sqrt(Iobs) / (2.0 * D_norm * sqrtI ** 3)
+#     else:  # "poisson"
+#         N = Iobs.size
+#         Icalc_safe = jnp.clip(Icalc, 1e-12, None)
+#         h_prime = (1.0 - Iobs / Icalc_safe) / N
+#         h_double_prime = (Iobs / Icalc_safe ** 2) / N
 
-    HH = jnp.sum(h_double_prime * dIcalc ** 2 + h_prime * d2Icalc)
+#     HH = jnp.sum(h_double_prime * dIcalc ** 2 + h_prime * d2Icalc)
 
-    grad_dot_s = sum(
-        jnp.sum(g * si) for g, si in zip(
-            jax.tree_util.tree_leaves(grad), jax.tree_util.tree_leaves(s)
-        )
-    )
-    alpha_newton = -grad_dot_s / HH
+#     grad_dot_s = sum(
+#         jnp.sum(g * si) for g, si in zip(
+#             jax.tree_util.tree_leaves(grad), jax.tree_util.tree_leaves(s)
+#         )
+#     )
+#     alpha_newton = -grad_dot_s / HH
 
-    alpha_max = alpha_multiplier * schedule_alpha
-    valid = jnp.logical_and(HH > 0, jnp.isfinite(alpha_newton))
-    return jnp.where(valid, jnp.clip(alpha_newton, 0.0, alpha_max), schedule_alpha)
+#     alpha_max = alpha_multiplier * schedule_alpha
+#     valid = jnp.logical_and(HH > 0, jnp.isfinite(alpha_newton))
+#     return jnp.where(valid, jnp.clip(alpha_newton, 0.0, alpha_max), schedule_alpha)
     
 # def _solve_one_adam(
 #     params0, static, max_steps, tol, learning_rate,
@@ -241,9 +241,37 @@ def _solve_one_adam(
     decay_steps=500, decay_rate=0.9, staircase=True,
     b1=0.9, b2=0.98, eps_adam=1e-6,
     variant="amsgrad",
-    newton_step_size=False,     # NEW
-    newton_alpha_multiplier=5.0,      # NEW
+    newton_step_size=False,
+    newton_alpha_multiplier=5.0,
+    newton_intensity_floor=1.0,
+    newton_max_backtracks=4,
+    clip_norm=None,       # NEW -- global gradient-norm clip, applied before scale_by_*
+    sign_grad=False,      # NEW -- use sign(grad) as the direction fed to scale_by_*
 ):
+    """... existing docstring ...
+
+    clip_norm : float or None
+        If set, clips the global L2 norm of the raw gradient to this value
+        before AMSGrad/AdaBelief/Lion normalization -- a bounded-magnitude
+        gradient regardless of how wrong the current point is, testing
+        whether `mae`+Adam's advantage on this landscape is really "bounded
+        step size" rather than anything MAE-specific. Composes with any
+        `variant` and with `newton_step_size` (clip -> scale -> [schedule]).
+    sign_grad : bool
+        If True, replaces the gradient with elementwise sign(grad) before
+        it reaches scale_by_*, i.e. every voxel/parameter contributes a
+        fixed-magnitude push in its gradient's direction only -- a closer
+        structural match to mae's own gradient (+-1/sum(Iobs) per voxel,
+        magnitude-independent of the residual) than clip_norm is. Mutually
+        compatible with clip_norm (sign first would make clipping a
+        no-op on magnitude; apply clip_norm to the raw gradient, sign_grad
+        replaces it entirely -- if both are set, sign_grad wins, since
+        clipping a vector of +-1's does nothing meaningful).
+        Newton step size, if also enabled, still uses the TRUE (untouched)
+        gradient for its optimality condition -- only the direction fed
+        to solver.update is affected by sign_grad/clip_norm; alpha's
+        derivation assumes the real gradient, not a modified stand-in.
+    """
     schedule = optax.exponential_decay(
         init_value=learning_rate, transition_steps=decay_steps,
         decay_rate=decay_rate, staircase=staircase,
@@ -258,9 +286,13 @@ def _solve_one_adam(
     else:
         raise ValueError(f"Unknown variant: {variant!r}, choose 'amsgrad', 'adabelief' or 'lion'.")
 
-    # direction-only solver when using Newton step size; otherwise chain
-    # the schedule in as before (unchanged default behavior).
-    solver = scale if newton_step_size else optax.chain(scale, optax.scale_by_learning_rate(schedule))
+    transforms = []
+    if clip_norm is not None:
+        transforms.append(optax.clip_by_global_norm(clip_norm))
+    transforms.append(scale)
+    if not newton_step_size:
+        transforms.append(optax.scale_by_learning_rate(schedule))
+    solver = optax.chain(*transforms)
 
     def f(p):
         return loss_fn(p, static)
@@ -270,20 +302,45 @@ def _solve_one_adam(
 
     def cond_fn(carry):
         step, _params, _state, _value, grad = carry
+        # convergence criterion always uses the TRUE gradient norm, even
+        # when sign_grad reshapes what's actually fed to the optimizer
         return jnp.logical_and(step < max_steps, optax.tree.norm(grad) > tol)
 
     def body_fn(carry):
         step, params, opt_state, value, grad = carry
-        direction, opt_state = solver.update(grad, opt_state, params)
+
+        grad_for_update = (
+            jax.tree_util.tree_map(jnp.sign, grad) if sign_grad else grad
+        )
+        direction, opt_state = solver.update(grad_for_update, opt_state, params)
 
         if newton_step_size:
             schedule_alpha = schedule(step)
-            alpha = _newton_step_size(
-                params, grad, direction, static, schedule_alpha, alpha_multiplier=newton_alpha_multiplier
+            alpha0 = _newton_step_size(
+                params, grad, direction, static, schedule_alpha,   # true `grad`, not grad_for_update
+                alpha_multiplier=newton_alpha_multiplier,
+                intensity_floor=newton_intensity_floor,
             )
+
+            def try_params(a):
+                upd = jax.tree_util.tree_map(lambda d: -a * d, direction)
+                return optax.apply_updates(params, upd)
+
+            def bt_cond(c):
+                i, _a, improved = c
+                return jnp.logical_and(i < newton_max_backtracks, jnp.logical_not(improved))
+
+            def bt_body(c):
+                i, a, _improved = c
+                candidate_loss = loss_fn(try_params(a), static)
+                improved = candidate_loss < value
+                return (i + 1, jnp.where(improved, a, a * 0.5), improved)
+
+            _i, alpha_bt, improved = lax.while_loop(bt_cond, bt_body, (0, alpha0, False))
+            alpha = jnp.where(improved, alpha_bt, schedule_alpha)
             updates = jax.tree_util.tree_map(lambda d: -alpha * d, direction)
         else:
-            updates = direction  # schedule's -lr already baked in via scale_by_learning_rate
+            updates = direction
 
         params = optax.apply_updates(params, updates)
         value, grad = jax.value_and_grad(f)(params)
@@ -319,12 +376,6 @@ class ReconstructionResult(NamedTuple):
     model_static: dict         # shared; phase_type/support_type/etc.
     eps: float
     all_params: Optional[dict] = None
-    # Full population pytree (leading (n_restarts, ...) axis on every
-    # leaf), not just the argmin. Cheap to keep for "single"/"multi"
-    # support (O(N) or O(M*N) params/restart); can be sizeable for
-    # "freeform" (O(D*H*W) params/restart) at large grids/n_restarts --
-    # this is what `reconstruct_two_stage` uses to pick more than the
-    # single best stage-1 restart to carry into stage 2.
 
     def evaluate(self, Iobs):
         """Recompute (support, amplitude, phase) for the best restart."""
@@ -357,8 +408,8 @@ def reconstruct(
     grid_shape=None,
     variant="amsgrad",            # "amsgrad" | "adabelief" | "lion"
     stop_amplitude_grad=False,    # restored
-    newton_step_size=False,     # NEW
-    newton_alpha_multiplier=5.0,      # NEW
+    clip_norm=None,     # NEW
+    sign_grad=False,    # NEW
 ):
     Iobs = jnp.asarray(Iobs, dtype=jnp.float32)
     if grid_shape is None:
@@ -389,7 +440,7 @@ def reconstruct(
         learning_rate=learning_rate, decay_steps=decay_steps,
         decay_rate=decay_rate, staircase=staircase,
         b1=b1, b2=b2, eps_adam=eps_adam, variant=variant,
-        newton_step_size=newton_step_size, newton_alpha_multiplier=newton_alpha_multiplier,
+        newton_step_size=newton_step_size, clip_norm=clip_norm, sign_grad=sign_grad,
     )
     batched_solve = jax.vmap(solve, in_axes=(0,))
 

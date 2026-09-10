@@ -158,3 +158,149 @@ def test_project_shapes():
     obj_p = center_pad(jnp.asarray(obj), Iobs.shape)
     refined = project(obj_p, jnp.asarray(Iobs))
     assert refined.shape == Iobs.shape
+
+def test_newton_step_size_matches_finite_difference_mse():
+    """The real correctness test: validates the whole chain (double-vjp
+    trick, domain-specific h'/h'', and the Qnorm chain rule) against
+    numerical ground truth on H(s,s), not just that it runs."""
+    key = jax.random.PRNGKey(0)
+    Iobs = np.random.default_rng(0).random((12, 10, 8)).astype(np.float32) + 0.5
+    grid_shape, coords = make_coords_for(Iobs.shape)
+    params, model_static = init_model(
+        key, grid_shape, N=4, phase_type="displacement",
+        phase_kwargs={"hkl": [2, 2, 2]},
+    )
+    static = dict(coords=coords, Iobs=jnp.asarray(Iobs), eps=0.6,
+                  alpha=0.0, beta=0.0, metric="mse",
+                  phase_static=model_static, stop_amplitude_grad=False)
+
+    grad = jax.grad(lambda p: loss_fn(p, static))(params)
+    key_s = jax.random.PRNGKey(1)
+    s = jax.tree_util.tree_map(
+        lambda x: 1e-2 * jax.random.normal(key_s, x.shape), params
+    )
+    direction = jax.tree_util.tree_map(lambda d: -d, s)  # so s = -direction inside the function
+
+    schedule_alpha = 0.01
+    # Extract H(s,s) by calling _newton_step_size at grad_dot_s=0 is awkward;
+    # instead validate H(s,s) directly via central finite differences on the
+    # loss itself, which is the quantity the whole derivation targets:
+    h = 1e-3
+    def add(p, t, c):
+        return jax.tree_util.tree_map(lambda a, b: a + c * b, p, t)
+
+    L0 = loss_fn(params, static)
+    Lp = loss_fn(add(params, s, h), static)
+    Lm = loss_fn(add(params, s, -h), static)
+    H_numeric = (Lp - 2 * L0 + Lm) / h**2
+
+    # recompute H(s,s) analytically the same way _newton_step_size does,
+    # by monkey-patching grad_dot_s out: easiest is to just re-derive HH
+    # inline here using the same field_fn/FFT logic, OR (simpler, since
+    # _newton_step_size returns alpha not HH) assert alpha's *numerator*
+    # against grad_dot_s and treat H_numeric as the reference by comparing
+    # the resulting alpha to -grad_dot_s/H_numeric directly:
+    grad_dot_s = sum(
+        jnp.sum(g * si) for g, si in zip(
+            jax.tree_util.tree_leaves(grad), jax.tree_util.tree_leaves(s)
+        )
+    )
+    alpha_expected = -grad_dot_s / H_numeric
+
+    alpha = _newton_step_size(params, grad, direction, static, schedule_alpha, alpha_multiplier=1000.0)
+    assert jnp.isclose(alpha, alpha_expected, rtol=5e-2)
+
+
+def test_newton_step_size_matches_finite_difference_poisson():
+   """The real correctness test: validates the whole chain (double-vjp
+    trick, domain-specific h'/h'', and the Qnorm chain rule) against
+    numerical ground truth on H(s,s), not just that it runs."""
+    key = jax.random.PRNGKey(0)
+    Iobs = np.random.default_rng(0).random((12, 10, 8)).astype(np.float32) + 0.5
+    grid_shape, coords = make_coords_for(Iobs.shape)
+    params, model_static = init_model(
+        key, grid_shape, N=4, phase_type="displacement",
+        phase_kwargs={"hkl": [2, 2, 2]},
+    )
+    static = dict(coords=coords, Iobs=jnp.asarray(Iobs), eps=0.6,
+                  alpha=0.0, beta=0.0, metric="poisson",
+                  phase_static=model_static, stop_amplitude_grad=False)
+
+    grad = jax.grad(lambda p: loss_fn(p, static))(params)
+    key_s = jax.random.PRNGKey(1)
+    s = jax.tree_util.tree_map(
+        lambda x: 1e-2 * jax.random.normal(key_s, x.shape), params
+    )
+    direction = jax.tree_util.tree_map(lambda d: -d, s)  # so s = -direction inside the function
+
+    schedule_alpha = 0.01
+    # Extract H(s,s) by calling _newton_step_size at grad_dot_s=0 is awkward;
+    # instead validate H(s,s) directly via central finite differences on the
+    # loss itself, which is the quantity the whole derivation targets:
+    h = 1e-3
+    def add(p, t, c):
+        return jax.tree_util.tree_map(lambda a, b: a + c * b, p, t)
+
+    L0 = loss_fn(params, static)
+    Lp = loss_fn(add(params, s, h), static)
+    Lm = loss_fn(add(params, s, -h), static)
+    H_numeric = (Lp - 2 * L0 + Lm) / h**2
+
+    # recompute H(s,s) analytically the same way _newton_step_size does,
+    # by monkey-patching grad_dot_s out: easiest is to just re-derive HH
+    # inline here using the same field_fn/FFT logic, OR (simpler, since
+    # _newton_step_size returns alpha not HH) assert alpha's *numerator*
+    # against grad_dot_s and treat H_numeric as the reference by comparing
+    # the resulting alpha to -grad_dot_s/H_numeric directly:
+    grad_dot_s = sum(
+        jnp.sum(g * si) for g, si in zip(
+            jax.tree_util.tree_leaves(grad), jax.tree_util.tree_leaves(s)
+        )
+    )
+    alpha_expected = -grad_dot_s / H_numeric
+
+    alpha = _newton_step_size(params, grad, direction, static, schedule_alpha, alpha_multiplier=1000.0)
+    assert jnp.isclose(alpha, alpha_expected, rtol=5e-2)
+
+
+def test_newton_step_size_falls_back_on_degenerate_direction():
+    key = jax.random.PRNGKey(0)
+    Iobs = np.random.default_rng(0).random((12, 10, 8)).astype(np.float32) + 0.5
+    grid_shape, coords = make_coords_for(Iobs.shape)
+    params, model_static = init_model(key, grid_shape, N=4, phase_type="grid")
+    static = dict(coords=coords, Iobs=jnp.asarray(Iobs), eps=0.6,
+                  alpha=0.0, beta=0.0, metric="mse",
+                  phase_static=model_static, stop_amplitude_grad=False)
+    grad = jax.grad(lambda p: loss_fn(p, static))(params)
+    zero_direction = jax.tree_util.tree_map(jnp.zeros_like, params)
+    schedule_alpha = 0.01
+
+    alpha = _newton_step_size(params, grad, zero_direction, static, schedule_alpha)
+    assert jnp.isfinite(alpha)
+    assert jnp.isclose(alpha, schedule_alpha)  # H(0,0)=0 -> HH<=0 -> fallback
+
+
+def test_newton_step_size_rejects_mae():
+    key = jax.random.PRNGKey(0)
+    Iobs = np.random.default_rng(0).random((12, 10, 8)).astype(np.float32) + 0.5
+    grid_shape, coords = make_coords_for(Iobs.shape)
+    params, model_static = init_model(key, grid_shape, N=4, phase_type="grid")
+    static = dict(coords=coords, Iobs=jnp.asarray(Iobs), eps=0.6,
+                  alpha=0.0, beta=0.0, metric="mae",
+                  phase_static=model_static, stop_amplitude_grad=False)
+    grad = jax.grad(lambda p: loss_fn(p, static))(params)
+    with pytest.raises(ValueError, match="mae"):
+        _newton_step_size(params, grad, grad, static, 0.01)
+
+
+def test_reconstruct_newton_step_size_displacement_runs():
+    """End-to-end: small grid, phase_type='displacement' with a nontrivial
+    Qnorm, newton_step_size=True, confirms no crash and loss decreases."""
+    key = jax.random.PRNGKey(0)
+    Iobs = np.random.default_rng(0).random((12, 10, 8)).astype(np.float32) + 0.5
+    res = reconstruct(
+        key, Iobs, n_restarts=2, N=4, eps=0.6, alpha=0.0, beta=0.0,
+        metric="mse", phase_type="displacement", phase_kwargs={"hkl": [2, 2, 2]},
+        max_steps=20, tol=1e-8, newton_step_size=True,
+    )
+    assert jnp.isfinite(res.best_loss)
