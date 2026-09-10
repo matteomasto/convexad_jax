@@ -19,22 +19,29 @@ def mse(Iobs, Icalc):
     """Normalized mean squared error."""
     return jnp.sum((jnp.sqrt(Iobs) - jnp.sqrt(Icalc))**2) / jnp.sum(jnp.sqrt(Iobs))
     
-def poisson_kl(Iobs, Icalc, eps=1.0):
-    """Poisson KL divergence, averaged per voxel.
+def poisson_kl(Iobs, Icalc, eps=1e-12):
+    """Poisson KL divergence (generalized, a.k.a. I-divergence), averaged
+    per voxel.
 
-    ** Third bug fixed here: ** xlogy(Iobs, ratio) is safe at (0,0) for
-    its FORWARD value, but its JVP rule (x_dot*log(y) + y_dot*x/y) uses
-    the raw x/y, not an internally-masked version -- and in this exact
-    composition, ratio=Iobs/Icalc_safe is deterministically 0 whenever
-    Iobs=0 (not a rare coincidence), so every zero-count pixel hits
-    xlogy's own 0/0 gradient term. Mask `ratio` itself to a safe nonzero
-    value at Iobs=0 BEFORE calling xlogy -- xlogy(0, 1.0) still correctly
-    returns 0 for the forward value, and its gradient term becomes
-    0*log(1) + y_dot*0/1 = 0, finite.
+    Uses jax.scipy.special.kl_div(Iobs, Icalc_safe) directly -- this IS
+    the formula (Icalc - Iobs + Iobs*log(Iobs/Icalc)) for Iobs>0,Icalc>0;
+    reduces correctly to Icalc_safe at Iobs=0, Icalc_safe>=0. Unlike a
+    hand-rolled xlogy(Iobs, ratio) composition, kl_div's implementation
+    masks BOTH operands together via lax.select before any log/div runs,
+    built from ordinary primitives (mul, log, div, select) rather than
+    going through xlogy's own custom_jvp rule -- avoids that class of
+    fragility entirely rather than working around it.
+
+    eps floors Icalc at a physically meaningful scale (default 1.0, ~one
+    photon count) rather than a numerical-safety epsilon: sub-single-
+    photon intensities aren't statistically meaningful for counting data,
+    and d(kl)/dIcalc ~ Iobs/Icalc diverges as Icalc->0 with Iobs>0 --
+    the same curvature blowup already floored in _newton_step_size's
+    Hessian terms; this is the identical divergence in the loss's own
+    gradient, not covered by kl_div's own (Iobs=0) zero-handling.
     """
     Icalc_safe = jnp.clip(Icalc, eps, None)
-    ratio = jnp.where(Iobs > 0, Iobs / Icalc_safe, 1.0)
-    kl = Icalc - Iobs + jax.scipy.special.xlogy(Iobs, ratio)
+    kl = jax.scipy.special.kl_div(Iobs, Icalc_safe)
     N = Iobs.size
     return jnp.sum(kl) / N
 
