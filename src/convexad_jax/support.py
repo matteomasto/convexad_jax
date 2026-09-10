@@ -19,18 +19,9 @@ def _sigma_i(n_i, d_i, coords, eps):
     return jax.nn.sigmoid((d_i - dot) / eps)
 
 
-@partial(jax.custom_jvp, nondiff_argnums=(3,))
+@jax.custom_vjp
 def halfspace_support(n, d, coords, eps):
-    """Soft polytope indicator, memory O(D*H*W) instead of O(D*H*W*N).
-
-    custom_jvp (not custom_vjp): the forward-mode rule below is linear in
-    its tangents, so JAX auto-transposes it to also give the correct
-    reverse-mode gradient (jax.grad) -- one rule serves both directions.
-    A custom_vjp-only version raises "can't apply forward-mode autodiff
-    to a custom_vjp function" on any jax.jvp/jax.linearize call through
-    it -- exactly the error hit by both the GN-CG Jacobian-vector product
-    and the Newton step-size rule's jax.jvp in optimize.py.
-    """
+    """Soft polytope indicator, memory O(D*H*W) instead of O(D*H*W*N)."""
     logS0 = jnp.zeros(coords.shape[:3], dtype=coords.dtype)
 
     def step(logS, nd_i):
@@ -43,41 +34,31 @@ def halfspace_support(n, d, coords, eps):
     return jnp.exp(logS)
 
 
-@halfspace_support.defjvp
-def _halfspace_support_jvp(eps, primals, tangents):
-    """Forward-mode rule: dS = S * sum_i active_i*(1-sigma_i)*dz_i, with
-    dz_i = (dd_i - dn_i.x - n_i.dx)/eps -- same clip-boundary mask
-    ('active') and coords-tangent term as the original reverse-mode rule,
-    run forward instead of backward.
-    """
-    n, d, coords = primals
-    dn, dd, dcoords = tangents
+def _halfspace_support_fwd(n, d, coords, eps):
+    S = halfspace_support(n, d, coords, eps)
+    return S, (n, d, coords, eps, S)
 
-    def step(carry, nd_dndd):
-        logS, dlogS = carry
-        n_i, d_i, dn_i, dd_i = nd_dndd
 
-        dot = jnp.einsum("dhwc,c->dhw", coords, n_i)
-        z_i = (d_i - dot) / eps
-        sigma = jax.nn.sigmoid(z_i)
+def _halfspace_support_bwd(res, g):
+    n, d, coords, eps, S = res
+    gS = g * S
+
+    def step(dcoords_acc, nd_i):
+        n_i, d_i = nd_i
+        sigma = _sigma_i(n_i, d_i, coords, eps)
         active = jnp.logical_and(sigma > 1e-6, sigma < 1.0).astype(sigma.dtype)
+        w = gS * active * (1.0 - sigma) / eps
+        dd_i = jnp.sum(w)
+        dn_i = -jnp.einsum("dhw,dhwc->c", w, coords)
+        dcoords_acc = dcoords_acc - w[..., None] * n_i
+        return dcoords_acc, (dn_i, dd_i)
 
-        logS = logS + jnp.log(jnp.clip(sigma, 1e-6, 1.0))
+    dcoords0 = jnp.zeros_like(coords)
+    dcoords, (dn, dd) = lax.scan(step, dcoords0, (n, d))
+    return dn, dd, dcoords, None
 
-        ddot = (jnp.einsum("dhwc,c->dhw", coords, dn_i)
-                + jnp.einsum("dhwc,c->dhw", dcoords, n_i))
-        dz_i = (dd_i - ddot) / eps
-        dlogS = dlogS + active * (1.0 - sigma) * dz_i
 
-        return (logS, dlogS), None
-
-    D, H, W = coords.shape[:3]
-    zeros = jnp.zeros((D, H, W), dtype=coords.dtype)
-    (logS, dlogS), _ = lax.scan(step, (zeros, zeros), (n, d, dn, dd))
-
-    S = jnp.exp(logS)
-    dS = S * dlogS
-    return S, dS
+halfspace_support.defvjp(_halfspace_support_fwd, _halfspace_support_bwd)
 
 
 def stereographic_to_unit(p):

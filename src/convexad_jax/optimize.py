@@ -65,32 +65,40 @@ def init_population(key, n_restarts, grid_shape, N=64, size_factor=4.0,
     params0 = jax.vmap(init_one)(keys)
     return params0, model_static
     
-def _newton_step_size(params, grad, direction, static, schedule_alpha, alpha_max=10.0):
-    """Bilinear-Hessian Newton step size (Carlsson et al., eq. 20) for the
-    descent direction `s = -direction` (direction is the raw AMSGrad/
-    AdaBelief/Lion-preconditioned gradient, same sign as `grad`, i.e. NOT
-    yet a descent direction -- optax's scale_by_* transforms don't negate;
-    only scale_by_learning_rate does).
+def _jvp_via_vjp(f_vjp, y_like, v):
+    """J @ v via reverse-mode-only 'vjp of vjp'. Needed because
+    halfspace_support only has a custom_vjp -- native jax.jvp/jax.linearize
+    raise on it. (A custom_jvp+lax.scan alternative was tried and reverted:
+    it broke ordinary jax.grad via a lax.scan-transpose limitation, not
+    just added the missing forward-mode path.)
+    """
+    def h(u):
+        return f_vjp(u)[0]
+    _, h_vjp = jax.vjp(h, jnp.zeros_like(y_like))
+    return h_vjp(v)[0]
 
-    alpha = -<grad, s> / H|params(s, s)
 
-    H is computed exactly for the o -> Icalc -> metric layers (closed
-    form, one extra FFT via jax.jvp through the theta->o map -- the
-    parametrization layer, support/phase, is handled by ordinary JAX AD;
-    see the "hybrid" recipe discussed for _gn_cg_step). alpha/beta
-    regularizer curvature is NOT included (their contribution is usually
-    small; alpha=0 in your current runs makes this moot for that term).
+def _newton_step_size(params, grad, direction, static, schedule_alpha, alpha_multiplier=5.0):
+    """Bilinear-Hessian Newton step size (Carlsson et al. 2025, eq. 20):
+    alpha = -<grad, s> / H|params(s, s), s = -direction.
 
-    metric='mae' is not supported: its bilinear Hessian is 0 a.e. (mae's
-    h''(I)=0 except at the single non-differentiable point I=Iobs) --
-    the Newton rule is undefined for it by construction, not a missing
-    feature.
+    H is exact for o -> Icalc -> metric (closed form, one extra FFT); the
+    params -> o layer (support's halfspace_support, amplitude's Parseval
+    normalization, phase's Qnorm*u or phasor) goes through _jvp_via_vjp on
+    the SAME forward() grad already uses -- Qnorm's chain-rule contribution
+    is picked up automatically and exactly, no special-casing needed for
+    phase_type="displacement". See module notes on why this is safe to mix
+    with Qnorm's existing benefit under AMSGrad, and the one real caveat:
+    alpha is a single global scalar over the whole (support, phase)
+    direction, not a per-block step size.
 
-    Falls back to `schedule_alpha` (the exponential-decay schedule's
-    current value) whenever H(s,s) <= 0 (local non-convexity along s,
-    expected especially early in optimization) or the result isn't
-    finite, and always clips to `alpha_max` as a guard against a
-    near-zero H(s,s) blowing the step up.
+    metric must be 'mse' or 'poisson' -- matches losses.mse (sqrt/amplitude
+    domain) and losses.poisson_kl (raw intensity domain) exactly, each in
+    its own correct domain. 'mae' is unsupported: h''(I)=0 a.e. for it.
+
+    Falls back to `schedule_alpha` when H(s,s) <= 0 or the result isn't
+    finite; alpha_max = alpha_multiplier * schedule_alpha (dynamic, tied
+    to the schedule's current value rather than a fixed constant).
     """
     metric = static["metric"]
     if metric not in ("mse", "poisson"):
@@ -99,7 +107,7 @@ def _newton_step_size(params, grad, direction, static, schedule_alpha, alpha_max
             f"(mae's bilinear Hessian is 0 a.e.), got {metric!r}."
         )
 
-    s = jax.tree_util.tree_map(lambda d: -d, direction)  # actual descent direction
+    s = jax.tree_util.tree_map(lambda d: -d, direction)
 
     def field_fn(p):
         support, amplitude, phase = forward(
@@ -113,7 +121,9 @@ def _newton_step_size(params, grad, direction, static, schedule_alpha, alpha_max
             return jax.lax.complex(modulus * c, modulus * sn)
         return jax.lax.complex(modulus * jnp.cos(phase), modulus * jnp.sin(phase))
 
-    o, delta_o = jax.jvp(field_fn, (params,), (s,))
+    o, field_vjp = jax.vjp(field_fn, params)
+    delta_o = _jvp_via_vjp(field_vjp, o, s)
+
     Iobs = static["Iobs"].astype(jnp.float32)
     o_p = _center_pad(o, Iobs.shape)
     do_p = _center_pad(delta_o, Iobs.shape)
@@ -122,13 +132,14 @@ def _newton_step_size(params, grad, direction, static, schedule_alpha, alpha_max
     Fdo = jnp.fft.ifftshift(jnp.fft.fftn(jnp.fft.fftshift(do_p)))
 
     Icalc   = jnp.abs(z) ** 2
-    dIcalc  = 2.0 * jnp.real(jnp.conj(z) * Fdo)   # dIcalc|_o(delta_o)
-    d2Icalc = 2.0 * jnp.abs(Fdo) ** 2              # d^2Icalc|_o(delta_o, delta_o) -- exact
+    dIcalc  = 2.0 * jnp.real(jnp.conj(z) * Fdo)
+    d2Icalc = 2.0 * jnp.abs(Fdo) ** 2
 
     if metric == "mse":
         D_norm = jnp.sum(jnp.sqrt(Iobs))
-        r = jnp.sqrt(Iobs) - jnp.sqrt(jnp.clip(Icalc, 1e-12, None))
-        sqrtI = jnp.sqrt(jnp.clip(Icalc, 1e-12, None))
+        Icalc_safe = jnp.clip(Icalc, 1e-12, None)
+        sqrtI = jnp.sqrt(Icalc_safe)
+        r = jnp.sqrt(Iobs) - sqrtI
         h_prime = -r / (D_norm * sqrtI)
         h_double_prime = jnp.sqrt(Iobs) / (2.0 * D_norm * sqrtI ** 3)
     else:  # "poisson"
@@ -146,6 +157,7 @@ def _newton_step_size(params, grad, direction, static, schedule_alpha, alpha_max
     )
     alpha_newton = -grad_dot_s / HH
 
+    alpha_max = alpha_multiplier * schedule_alpha
     valid = jnp.logical_and(HH > 0, jnp.isfinite(alpha_newton))
     return jnp.where(valid, jnp.clip(alpha_newton, 0.0, alpha_max), schedule_alpha)
     
@@ -230,7 +242,7 @@ def _solve_one_adam(
     b1=0.9, b2=0.98, eps_adam=1e-6,
     variant="amsgrad",
     newton_step_size=False,     # NEW
-    newton_alpha_max=10.0,      # NEW
+    newton_alpha_multiplier=5.0,      # NEW
 ):
     schedule = optax.exponential_decay(
         init_value=learning_rate, transition_steps=decay_steps,
@@ -267,7 +279,7 @@ def _solve_one_adam(
         if newton_step_size:
             schedule_alpha = schedule(step)
             alpha = _newton_step_size(
-                params, grad, direction, static, schedule_alpha, alpha_max=newton_alpha_max
+                params, grad, direction, static, schedule_alpha, alpha_multiplier=newton_alpha_multiplier
             )
             updates = jax.tree_util.tree_map(lambda d: -alpha * d, direction)
         else:
@@ -346,7 +358,7 @@ def reconstruct(
     variant="amsgrad",            # "amsgrad" | "adabelief" | "lion"
     stop_amplitude_grad=False,    # restored
     newton_step_size=False,     # NEW
-    newton_alpha_max=10.0,      # NEW
+    newton_alpha_multiplier=5.0,      # NEW
 ):
     Iobs = jnp.asarray(Iobs, dtype=jnp.float32)
     if grid_shape is None:
@@ -377,7 +389,7 @@ def reconstruct(
         learning_rate=learning_rate, decay_steps=decay_steps,
         decay_rate=decay_rate, staircase=staircase,
         b1=b1, b2=b2, eps_adam=eps_adam, variant=variant,
-        newton_step_size=newton_step_size, newton_alpha_max=newton_alpha_max,
+        newton_step_size=newton_step_size, newton_alpha_multiplier=newton_alpha_multiplier,
     )
     batched_solve = jax.vmap(solve, in_axes=(0,))
 
