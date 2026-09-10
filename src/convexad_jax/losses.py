@@ -21,10 +21,25 @@ def mse(Iobs, Icalc):
     
 def poisson_kl(Iobs, Icalc, eps=1.0):
     """Poisson KL divergence, averaged per voxel.
+
+    Uses jax.scipy.special.xlogy(Iobs, ratio) instead of a manual
+    jnp.where(Iobs > 0, Iobs*jnp.log(ratio), 0.0) -- the manual version
+    masks the FORWARD value correctly but not the gradient (autodiff
+    differentiates both branches of `where` before selecting, so
+    log(ratio)'s -inf at Iobs=0 pixels still poisons the gradient via
+    0*inf=NaN). xlogy has a custom derivative rule specifically designed
+    to avoid this at x=0, mirroring tf.math.xlogy's behavior in the
+    original TF implementation.
+
+    The Icalc floor (`eps`) is kept regardless: it protects against a
+    DIFFERENT divergence (Icalc->0 while Iobs>0, where d(kl)/dIcalc ~
+    Iobs/Icalc blows up) that xlogy does not address, and guards against
+    xlogy's own residual weak spot when x=0 AND y=0 simultaneously (see
+    jax-ml/jax#15709) by keeping Icalc_safe away from exact zero.
     """
     Icalc_safe = jnp.clip(Icalc, eps, None)
     ratio = Iobs / Icalc_safe
-    kl = Icalc - Iobs + jnp.where(Iobs > 0, Iobs * jnp.log(ratio), 0.0)
+    kl = Icalc - Iobs + jax.scipy.special.xlogy(Iobs, ratio)
     N = Iobs.size
     return jnp.sum(kl) / N
 
